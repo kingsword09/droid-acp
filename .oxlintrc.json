@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript"],
+  "env": {
+    "es2022": true,
+    "node": true
+  },
+  "ignorePatterns": ["dist/**", "node_modules/**", "docs/**"],
+  "rules": {
+    "quotes": [
+      "error",
+      "double",
+      {
+        "allowTemplateLiterals": false,
+        "avoidEscape": true
+      }
+    ],
+    "semi": ["error", "always"],
+    "prefer-const": "error",
+    "no-console": "off",
+    "typescript/no-floating-promises": "error",
+    "typescript/no-misused-promises": [
+      "error",
+      {
+        "checksVoidReturn": false
+      }
+    ]
+  }
+}
