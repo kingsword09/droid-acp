@@ -1,266 +1,188 @@
 import {
-  Agent,
+  type Agent,
   AgentSideConnection,
-  AuthenticateRequest,
-  AvailableCommand,
-  CancelNotification,
-  ClientCapabilities,
-  InitializeRequest,
-  InitializeResponse,
+  type AuthenticateRequest,
+  type AuthenticateResponse,
+  type InitializeRequest,
+  type InitializeResponse,
+  type NewSessionRequest,
+  type NewSessionResponse,
+  type PromptRequest,
+  type PromptResponse,
+  type CancelNotification,
+  type SetSessionModelRequest,
+  type SetSessionModelResponse,
+  type SetSessionModeRequest,
+  type SetSessionModeResponse,
   ndJsonStream,
-  NewSessionRequest,
-  NewSessionResponse,
-  PromptRequest,
-  PromptResponse,
-  ReadTextFileRequest,
-  ReadTextFileResponse,
-  SessionNotification,
-  SetSessionModelRequest,
-  SetSessionModelResponse,
-  SetSessionModeRequest,
-  SetSessionModeResponse,
-  WriteTextFileRequest,
-  WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
-import { randomUUID } from "node:crypto";
-import { DroidProcess, type DroidMessage, type DroidOptions } from "./droid-process.ts";
-import { type Logger, nodeToWebReadable, nodeToWebWritable, Pushable } from "./utils.ts";
+import { createDroidAdapter, type DroidAdapter } from "./droid-adapter.ts";
+import {
+  ACP_TO_DROID_MODE,
+  type AutonomyLevel,
+  type DroidNotification,
+  type PermissionRequest,
+} from "./types.ts";
+import { type Logger, nodeToWebReadable, nodeToWebWritable } from "./utils.ts";
 
 const packageJson = { name: "droid-acp", version: "0.1.0" };
 
-type PermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "dontAsk" | "plan";
-
 interface Session {
-  droidProcess: DroidProcess;
-  input: Pushable<PromptRequest>;
+  id: string;
+  droid: DroidAdapter;
+  droidSessionId: string;
+  model: string;
+  mode: string;
   cancelled: boolean;
-  permissionMode: PermissionMode;
-  cwd: string;
-  currentModel?: string;
+  promptResolve: ((result: PromptResponse) => void) | null;
+  activeToolCallIds: Set<string>;
+  toolCallStatus: Map<string, "pending" | "in_progress" | "completed">;
+  toolNames: Map<string, string>;
 }
-
-interface ToolUseCache {
-  [key: string]: {
-    id: string;
-    name: string;
-    input: unknown;
-  };
-}
-
-const AVAILABLE_MODELS = [
-  {
-    modelId: "claude-opus-4-5-20251101",
-    name: "Claude Opus 4.5",
-    description: "Claude Opus 4.5 (default)",
-  },
-  {
-    modelId: "claude-sonnet-4-5-20250929",
-    name: "Claude Sonnet 4.5",
-    description: "Claude Sonnet 4.5",
-  },
-  {
-    modelId: "claude-haiku-4-5-20251001",
-    name: "Claude Haiku 4.5",
-    description: "Claude Haiku 4.5",
-  },
-  { modelId: "gpt-5.1", name: "GPT-5.1", description: "OpenAI GPT-5.1" },
-  { modelId: "gpt-5.1-codex", name: "GPT-5.1-Codex", description: "OpenAI GPT-5.1-Codex" },
-  { modelId: "gpt-5.1-codex-max", name: "GPT-5.1-Codex-Max", description: "GPT-5.1-Codex-Max" },
-  { modelId: "gpt-5.2", name: "GPT-5.2", description: "OpenAI GPT-5.2" },
-  { modelId: "gemini-3-pro-preview", name: "Gemini 3 Pro", description: "Gemini 3 Pro" },
-  { modelId: "glm-4.6", name: "Droid Core", description: "Droid Core (GLM-4.6)" },
-];
 
 export class DroidAcpAgent implements Agent {
-  sessions: Record<string, Session> = {};
-  client: AgentSideConnection;
-  toolUseCache: ToolUseCache = {};
-  clientCapabilities?: ClientCapabilities;
-  logger: Logger;
+  private sessions: Map<string, Session> = new Map();
+  private client: AgentSideConnection;
+  private logger: Logger;
 
   constructor(client: AgentSideConnection, logger?: Logger) {
     this.client = client;
     this.logger = logger ?? console;
+    this.logger.log("DroidAcpAgent initialized");
   }
 
-  async initialize(request: InitializeRequest): Promise<InitializeResponse> {
-    this.clientCapabilities = request.clientCapabilities;
-
+  async initialize(_request: InitializeRequest): Promise<InitializeResponse> {
+    this.logger.log("initialize");
     return {
       protocolVersion: 1,
       agentCapabilities: {
-        promptCapabilities: {
-          image: false,
-          embeddedContext: true,
-        },
-        sessionCapabilities: {},
+        promptCapabilities: { image: false, embeddedContext: true },
       },
       agentInfo: {
         name: packageJson.name,
-        title: "Droid",
+        title: "Factory Droid",
         version: packageJson.version,
       },
       authMethods: [
         {
-          id: "api-key",
-          name: "API Key",
+          id: "factory-api-key",
+          name: "Factory API Key",
           description: "Set FACTORY_API_KEY environment variable",
         },
       ],
     };
   }
 
-  async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
-    const sessionId = randomUUID();
+  async authenticate(request: AuthenticateRequest): Promise<AuthenticateResponse> {
+    this.logger.log("authenticate:", request.methodId);
+    if (request.methodId === "factory-api-key") {
+      if (!process.env.FACTORY_API_KEY) {
+        throw new Error("FACTORY_API_KEY environment variable is not set");
+      }
+      return {};
+    }
+    throw new Error(`Unknown auth method: ${request.methodId}`);
+  }
 
-    const droidOptions: DroidOptions = {
-      cwd: params.cwd,
-      sessionId,
-      logger: this.logger,
-      autoLevel: "medium",
-    };
+  async newSession(request: NewSessionRequest): Promise<NewSessionResponse> {
+    const cwd = request.cwd || process.cwd();
+    this.logger.log("newSession:", cwd);
 
-    const droidProcess = new DroidProcess(droidOptions);
-    const input = new Pushable<PromptRequest>();
+    const droid = createDroidAdapter({ cwd, logger: this.logger });
+    const initResult = await droid.start();
 
-    this.sessions[sessionId] = {
-      droidProcess,
-      input,
+    const sessionId = initResult.sessionId;
+    const session: Session = {
+      id: sessionId,
+      droid,
+      droidSessionId: initResult.sessionId,
+      model: initResult.settings?.modelId || "unknown",
+      mode: "medium",
       cancelled: false,
-      permissionMode: "default",
-      cwd: params.cwd,
-      currentModel: "claude-opus-4-5-20251101",
+      promptResolve: null,
+      activeToolCallIds: new Set(),
+      toolCallStatus: new Map(),
+      toolNames: new Map(),
     };
 
-    await droidProcess.start();
+    // Set up notification handler
+    droid.onNotification((n) => this.handleNotification(session, n));
 
-    droidProcess.on("message", (message: DroidMessage) => {
-      void this.handleDroidMessage(sessionId, message);
-    });
-
-    droidProcess.on("close", (code: number) => {
-      this.logger.log(`Droid process closed with code ${code}`);
-    });
-
-    droidProcess.on("error", (err: Error) => {
-      this.logger.error(`Droid process error: ${err.message}`);
-    });
-
-    const availableCommands: AvailableCommand[] = [];
-
-    setTimeout(() => {
-      void this.client.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "available_commands_update",
-          availableCommands,
-        },
+    // Forward raw events for debugging (enable with DROID_DEBUG=1)
+    if (process.env.DROID_DEBUG) {
+      droid.onRawEvent(async (event) => {
+        await this.client.sessionUpdate({
+          sessionId: session.id,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: `\n\`\`\`json\n${JSON.stringify(event, null, 2)}\n\`\`\`\n`,
+            },
+          },
+        });
       });
-    }, 0);
+    }
 
-    const availableModes = [
-      {
-        id: "default",
-        name: "Default",
-        description: "Standard behavior (read-only mode)",
-      },
-      {
-        id: "acceptEdits",
-        name: "Auto Low",
-        description: "Low-risk operations",
-      },
-      {
-        id: "dontAsk",
-        name: "Auto Medium",
-        description: "Development operations",
-      },
-      {
-        id: "bypassPermissions",
-        name: "Auto High",
-        description: "Production operations (dangerous)",
-      },
-    ];
+    // Handle permission requests
+    droid.onRequest(async (method, params) => {
+      if (method === "droid.request_permission") {
+        return this.handlePermission(session, params as PermissionRequest);
+      }
+      throw new Error("Method not supported");
+    });
+
+    // Handle droid process exit
+    droid.onExit(() => {
+      this.logger.log("Droid exited, cleaning up session:", session.id);
+      this.sessions.delete(session.id);
+    });
+
+    this.sessions.set(sessionId, session);
+    this.logger.log("Session created:", sessionId);
 
     return {
       sessionId,
       models: {
-        availableModels: AVAILABLE_MODELS,
-        currentModelId: "claude-opus-4-5-20251101",
+        availableModels: initResult.availableModels.map((m) => ({
+          modelId: m.id,
+          name: m.displayName,
+        })),
+        currentModelId: initResult.settings?.modelId || "unknown",
       },
       modes: {
-        currentModeId: "default",
-        availableModes,
+        currentModeId: "medium",
+        availableModes: [
+          {
+            id: "low",
+            name: "Suggest",
+            description: "Low - Safe file operations, requires confirmation",
+          },
+          {
+            id: "medium",
+            name: "Normal",
+            description: "Medium - Development tasks with moderate autonomy",
+          },
+          {
+            id: "high",
+            name: "Full",
+            description: "High - Production operations with full autonomy",
+          },
+        ],
       },
     };
   }
 
-  async authenticate(_params: AuthenticateRequest): Promise<void> {
-    throw new Error(
-      "Authentication via API key is required. Set FACTORY_API_KEY environment variable.",
-    );
-  }
+  async prompt(request: PromptRequest): Promise<PromptResponse> {
+    const session = this.sessions.get(request.sessionId);
+    if (!session) throw new Error(`Session not found: ${request.sessionId}`);
+    if (session.cancelled) throw new Error("Session cancelled");
 
-  async prompt(params: PromptRequest): Promise<PromptResponse> {
-    const session = this.sessions[params.sessionId];
-    if (!session) {
-      throw new Error("Session not found");
-    }
+    this.logger.log("prompt:", request.sessionId);
 
-    session.cancelled = false;
-
-    const promptText = this.extractPromptText(params);
-    if (!promptText) {
-      return { stopReason: "end_turn" };
-    }
-
-    const droidMessage: DroidMessage = {
-      type: "user",
-      role: "user",
-      content: promptText,
-    };
-
-    return new Promise<PromptResponse>((resolve, reject) => {
-      const messageHandler = (message: DroidMessage) => {
-        if (session.cancelled) {
-          session.droidProcess.removeListener("message", messageHandler);
-          resolve({ stopReason: "cancelled" });
-          return;
-        }
-
-        if (message.type === "result" || message.type === "end") {
-          session.droidProcess.removeListener("message", messageHandler);
-          resolve({ stopReason: "end_turn" });
-          return;
-        }
-
-        if (message.type === "error") {
-          session.droidProcess.removeListener("message", messageHandler);
-          const errorMsg = typeof message.message === "string" ? message.message : "Unknown error";
-          reject(new Error(errorMsg));
-          return;
-        }
-      };
-
-      session.droidProcess.on("message", messageHandler);
-
-      session.droidProcess.on("close", () => {
-        session.droidProcess.removeListener("message", messageHandler);
-        resolve({ stopReason: "end_turn" });
-      });
-
-      try {
-        session.droidProcess.send(droidMessage);
-      } catch (err) {
-        session.droidProcess.removeListener("message", messageHandler);
-        reject(err);
-      }
-    });
-  }
-
-  private extractPromptText(params: PromptRequest): string {
+    // Extract text from prompt content
     const parts: string[] = [];
-
-    for (const chunk of params.prompt) {
+    for (const chunk of request.prompt) {
       switch (chunk.type) {
         case "text":
           parts.push(chunk.text);
@@ -279,242 +201,241 @@ export class DroidAcpAgent implements Agent {
           break;
       }
     }
+    const text = parts.join("\n");
 
-    return parts.join("\n");
+    // Send message and wait for completion
+    return new Promise((resolve) => {
+      session.promptResolve = resolve;
+      session.droid.sendMessage(text);
+
+      // Timeout after 5 minutes
+      setTimeout(
+        () => {
+          if (session.promptResolve) {
+            session.promptResolve({ stopReason: "end_turn" });
+            session.promptResolve = null;
+          }
+        },
+        5 * 60 * 1000,
+      );
+    });
   }
 
-  private async handleDroidMessage(sessionId: string, message: DroidMessage): Promise<void> {
-    const session = this.sessions[sessionId];
-    if (!session) return;
-
-    const notifications = this.droidMessageToAcpNotifications(sessionId, message);
-    for (const notification of notifications) {
-      await this.client.sessionUpdate(notification);
-    }
-  }
-
-  private droidMessageToAcpNotifications(
-    sessionId: string,
-    message: DroidMessage,
-  ): SessionNotification[] {
-    const notifications: SessionNotification[] = [];
-
-    switch (message.type) {
-      case "text":
-      case "assistant":
-        if (message.content) {
-          const text =
-            typeof message.content === "string" ? message.content : JSON.stringify(message.content);
-          notifications.push({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: {
-                type: "text",
-                text,
-              },
-            },
-          });
-        }
-        break;
-
-      case "thinking":
-        if (message.content) {
-          const text =
-            typeof message.content === "string" ? message.content : JSON.stringify(message.content);
-          notifications.push({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_thought_chunk",
-              content: {
-                type: "text",
-                text,
-              },
-            },
-          });
-        }
-        break;
-
-      case "tool_use":
-      case "tool_call": {
-        const toolId = typeof message.id === "string" ? message.id : randomUUID();
-        const toolName = typeof message.name === "string" ? message.name : "unknown";
-        const toolInput = message.input;
-
-        this.toolUseCache[toolId] = {
-          id: toolId,
-          name: toolName,
-          input: toolInput,
-        };
-
-        notifications.push({
-          sessionId,
-          update: {
-            toolCallId: toolId,
-            sessionUpdate: "tool_call",
-            rawInput: toolInput,
-            status: "in_progress",
-            title: toolName,
-          },
-        });
-        break;
+  async cancel(request: CancelNotification): Promise<void> {
+    const session = this.sessions.get(request.sessionId);
+    if (session) {
+      this.logger.log("cancel:", request.sessionId);
+      session.cancelled = true;
+      if (session.promptResolve) {
+        session.promptResolve({ stopReason: "cancelled" });
+        session.promptResolve = null;
       }
-
-      case "tool_result": {
-        const toolUseId = typeof message.tool_use_id === "string" ? message.tool_use_id : "";
-        const cached = this.toolUseCache[toolUseId];
-
-        if (cached) {
-          notifications.push({
-            sessionId,
-            update: {
-              toolCallId: toolUseId,
-              sessionUpdate: "tool_call_update",
-              status: message.is_error ? "failed" : "completed",
-            },
-          });
-        }
-        break;
-      }
-
-      case "todo":
-      case "plan":
-        if (Array.isArray(message.entries)) {
-          notifications.push({
-            sessionId,
-            update: {
-              sessionUpdate: "plan",
-              entries: (
-                message.entries as Array<{ title?: string; status?: string; content?: string }>
-              ).map((entry, index) => {
-                const title = entry.title || JSON.stringify(entry);
-                return {
-                  id: `todo-${index}`,
-                  title,
-                  content: entry.content || title,
-                  priority: "medium" as const,
-                  status: (entry.status === "completed"
-                    ? "completed"
-                    : entry.status === "in_progress"
-                      ? "in_progress"
-                      : "pending") as "pending" | "in_progress" | "completed",
-                };
-              }),
-            },
-          });
-        }
-        break;
-
-      default:
-        break;
+      await session.droid.stop();
+      this.sessions.delete(request.sessionId);
     }
-
-    return notifications;
-  }
-
-  async cancel(params: CancelNotification): Promise<void> {
-    const session = this.sessions[params.sessionId];
-    if (!session) {
-      throw new Error("Session not found");
-    }
-
-    session.cancelled = true;
-    await session.droidProcess.stop();
   }
 
   async unstable_setSessionModel(
-    params: SetSessionModelRequest,
+    request: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse | void> {
-    const session = this.sessions[params.sessionId];
-    if (!session) {
-      throw new Error("Session not found");
+    const session = this.sessions.get(request.sessionId);
+    if (session) {
+      this.logger.log("setSessionModel:", request.modelId);
+      session.model = request.modelId;
+      session.droid.setModel(request.modelId);
     }
-
-    session.currentModel = params.modelId;
-
-    const newDroidOptions: DroidOptions = {
-      cwd: session.cwd,
-      sessionId: params.sessionId,
-      model: params.modelId,
-      logger: this.logger,
-      autoLevel: this.permissionModeToAutoLevel(session.permissionMode),
-    };
-
-    await session.droidProcess.stop();
-    session.droidProcess = new DroidProcess(newDroidOptions);
-    await session.droidProcess.start();
-
-    session.droidProcess.on("message", (message: DroidMessage) => {
-      void this.handleDroidMessage(params.sessionId, message);
-    });
   }
 
-  async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    const session = this.sessions[params.sessionId];
-    if (!session) {
-      throw new Error("Session not found");
+  async setSessionMode(request: SetSessionModeRequest): Promise<SetSessionModeResponse> {
+    const session = this.sessions.get(request.sessionId);
+    if (session) {
+      this.logger.log("setSessionMode:", request.modeId);
+      session.mode = request.modeId;
+      const droidMode = ACP_TO_DROID_MODE[request.modeId] as AutonomyLevel | undefined;
+      if (droidMode) {
+        session.droid.setMode(droidMode);
+      }
     }
-
-    const validModes: PermissionMode[] = [
-      "default",
-      "acceptEdits",
-      "bypassPermissions",
-      "dontAsk",
-      "plan",
-    ];
-
-    if (!validModes.includes(params.modeId as PermissionMode)) {
-      throw new Error("Invalid Mode");
-    }
-
-    session.permissionMode = params.modeId as PermissionMode;
-
-    const newDroidOptions: DroidOptions = {
-      cwd: session.cwd,
-      sessionId: params.sessionId,
-      model: session.currentModel,
-      logger: this.logger,
-      autoLevel: this.permissionModeToAutoLevel(session.permissionMode),
-    };
-
-    await session.droidProcess.stop();
-    session.droidProcess = new DroidProcess(newDroidOptions);
-    await session.droidProcess.start();
-
-    session.droidProcess.on("message", (message: DroidMessage) => {
-      void this.handleDroidMessage(params.sessionId, message);
-    });
-
     return {};
   }
 
-  private permissionModeToAutoLevel(mode: PermissionMode): "low" | "medium" | "high" | undefined {
-    switch (mode) {
-      case "default":
-        return undefined;
-      case "acceptEdits":
-        return "low";
-      case "dontAsk":
-        return "medium";
-      case "bypassPermissions":
-        return "high";
-      case "plan":
-        return undefined;
-      default:
-        return undefined;
+  private handlePermission(
+    session: Session,
+    params: PermissionRequest,
+  ): { selectedOption: "proceed_once" | "proceed_always" | "cancel" } {
+    const toolUse = params.toolUses?.[0]?.toolUse;
+    if (!toolUse) {
+      return { selectedOption: "proceed_once" };
+    }
+
+    const toolCallId = toolUse.id;
+    const toolName = toolUse.name;
+    const command = toolUse.input?.command || JSON.stringify(toolUse.input);
+    const riskLevel = toolUse.input?.riskLevel || "medium";
+
+    this.logger.log(
+      "Permission request for tool:",
+      toolCallId,
+      "risk:",
+      riskLevel,
+      "mode:",
+      session.mode,
+    );
+
+    // Emit tool_call (pending)
+    session.activeToolCallIds.add(toolCallId);
+    session.toolNames.set(toolCallId, toolName);
+    session.toolCallStatus.set(toolCallId, "pending");
+
+    void this.client.sessionUpdate({
+      sessionId: session.id,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: toolCallId,
+        title: `Running ${toolName}: ${String(command)}`,
+        status: "pending",
+      },
+    });
+
+    // Auto-approve/reject based on session mode and risk level
+    let decision: "proceed_once" | "proceed_always" | "cancel";
+
+    if (session.mode === "high") {
+      decision = "proceed_always";
+      this.logger.log("Auto-approved (high mode)");
+    } else if (session.mode === "medium") {
+      if (riskLevel === "low" || riskLevel === "medium") {
+        decision = "proceed_once";
+        this.logger.log("Auto-approved (medium mode, low/med risk)");
+      } else {
+        decision = "cancel";
+        this.logger.log("Auto-rejected (medium mode, high risk)");
+      }
+    } else {
+      decision = "cancel";
+      this.logger.log("Auto-rejected (low mode)");
+    }
+
+    // Update status based on decision
+    if (decision === "cancel") {
+      session.toolCallStatus.set(toolCallId, "completed");
+    } else {
+      session.toolCallStatus.set(toolCallId, "in_progress");
+    }
+
+    return { selectedOption: decision };
+  }
+
+  private async handleNotification(session: Session, n: DroidNotification): Promise<void> {
+    this.logger.log("notification:", n.type);
+
+    switch (n.type) {
+      case "message":
+        if (n.role === "assistant") {
+          // Handle tool use in message
+          if (n.toolUse) {
+            const toolCallId = n.toolUse.id;
+            if (!session.activeToolCallIds.has(toolCallId)) {
+              session.activeToolCallIds.add(toolCallId);
+              session.toolNames.set(toolCallId, n.toolUse.name);
+              session.toolCallStatus.set(toolCallId, "in_progress");
+              await this.client.sessionUpdate({
+                sessionId: session.id,
+                update: {
+                  sessionUpdate: "tool_call",
+                  toolCallId: toolCallId,
+                  title: `Running ${n.toolUse.name}`,
+                  status: "in_progress",
+                },
+              });
+            } else {
+              const status = session.toolCallStatus.get(toolCallId);
+              if (status !== "completed") {
+                session.toolCallStatus.set(toolCallId, "in_progress");
+                await this.client.sessionUpdate({
+                  sessionId: session.id,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: toolCallId,
+                    status: "in_progress",
+                  },
+                });
+              }
+            }
+          }
+
+          // Handle text content
+          if (n.text) {
+            await this.client.sessionUpdate({
+              sessionId: session.id,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: n.text },
+              },
+            });
+          }
+        }
+        break;
+
+      case "tool_result":
+        // Send the tool response content
+        await this.client.sessionUpdate({
+          sessionId: session.id,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: n.toolUseId,
+            content: [
+              {
+                type: "content",
+                content: {
+                  type: "text",
+                  text: n.content,
+                },
+              },
+            ],
+          },
+        });
+
+        // Send the completion status
+        session.toolCallStatus.set(n.toolUseId, "completed");
+        await this.client.sessionUpdate({
+          sessionId: session.id,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: n.toolUseId,
+            status: "completed",
+          },
+        });
+        break;
+
+      case "error":
+        await this.client.sessionUpdate({
+          sessionId: session.id,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `Error: ${n.message}` },
+          },
+        });
+        break;
+
+      case "complete":
+        if (session.promptResolve) {
+          session.promptResolve({ stopReason: "end_turn" });
+          session.promptResolve = null;
+        }
+        break;
     }
   }
 
-  async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
-    return await this.client.readTextFile(params);
-  }
-
-  async writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
-    return await this.client.writeTextFile(params);
+  async cleanup(): Promise<void> {
+    for (const [, session] of this.sessions) {
+      await session.droid.stop();
+    }
+    this.sessions.clear();
   }
 }
 
-export function runAcp() {
+export function runAcp(): void {
   const input = nodeToWebWritable(process.stdout);
   const output = nodeToWebReadable(process.stdin);
 
