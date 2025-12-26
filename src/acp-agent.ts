@@ -18,6 +18,7 @@ import {
   type PermissionOption,
   ndJsonStream,
 } from "@agentclientprotocol/sdk";
+import { createRequire } from "node:module";
 import { createDroidAdapter, type DroidAdapter } from "./droid-adapter.ts";
 import {
   ACP_MODES,
@@ -29,7 +30,11 @@ import {
 } from "./types.ts";
 import { type Logger, nodeToWebReadable, nodeToWebWritable } from "./utils.ts";
 
-const packageJson = { name: "droid-acp", version: "0.1.0" };
+const nodeRequire = createRequire(import.meta.url);
+const packageJson = nodeRequire("../package.json") as {
+  name: string;
+  version: string;
+};
 
 function normalizeBase64DataUrl(
   data: string,
