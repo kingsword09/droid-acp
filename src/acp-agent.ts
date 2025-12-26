@@ -256,6 +256,8 @@ export class DroidAcpAgent implements Agent {
       Boolean(process.env.SMITHERY_PROFILE);
     if (shouldEmitWebsearchStatus) {
       const websearchProxyBaseUrl = droid.getWebsearchProxyBaseUrl();
+      const parentFactoryApiKey = process.env.FACTORY_API_KEY;
+      const willInjectDummyFactoryApiKey = isEnvEnabled(process.env.DROID_ACP_WEBSEARCH) && !parentFactoryApiKey;
       setTimeout(() => {
         void this.client.sessionUpdate({
           sessionId,
@@ -270,7 +272,7 @@ export class DroidAcpAgent implements Agent {
                   `- DROID_ACP_WEBSEARCH_PORT: ${process.env.DROID_ACP_WEBSEARCH_PORT ?? "<unset>"}`,
                   `- DROID_ACP_WEBSEARCH_FORWARD_MODE: ${process.env.DROID_ACP_WEBSEARCH_FORWARD_MODE ?? "<unset>"}`,
                   `- DROID_ACP_WEBSEARCH_FORWARD_URL: ${process.env.DROID_ACP_WEBSEARCH_FORWARD_URL ?? "<unset>"}`,
-                  `- FACTORY_API_KEY: ${process.env.FACTORY_API_KEY ? "set" : "<unset>"}`,
+                  `- FACTORY_API_KEY: ${parentFactoryApiKey ? "set" : "<unset>"}${willInjectDummyFactoryApiKey ? " (droid child auto-inject dummy)" : ""}`,
                   `- SMITHERY_API_KEY: ${process.env.SMITHERY_API_KEY ? "set" : "<unset>"}`,
                   `- SMITHERY_PROFILE: ${process.env.SMITHERY_PROFILE ? "set" : "<unset>"}`,
                   `- proxyBaseUrl: ${websearchProxyBaseUrl ?? "<not running>"}`,
