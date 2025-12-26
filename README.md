@@ -9,8 +9,9 @@ Use Droid from any [ACP-compatible](https://agentclientprotocol.com) clients suc
 - Context @-mentions
 - Tool calls
 - TODO lists
+- Image prompts (e.g. paste screenshots in Zed)
 - Multiple model support
-- Session modes (Default, Auto Low, Auto Medium, Auto High)
+- Session modes (Spec, Manual, Auto Low/Medium/High)
 
 ## Installation
 
@@ -45,12 +46,13 @@ Configure Zed to use droid-acp as an external agent.
 
 ## Session Modes
 
-| Mode        | Description                       | Droid Auto Level |
-| ----------- | --------------------------------- | ---------------- |
-| Default     | Read-only mode, safe for planning | None             |
-| Auto Low    | Low-risk operations (file edits)  | `--auto low`     |
-| Auto Medium | Development operations            | `--auto medium`  |
-| Auto High   | Production operations (dangerous) | `--auto high`    |
+| Mode        | Description                                 | Droid autonomy level |
+| ----------- | ------------------------------------------- | -------------------- |
+| Spec        | Plan-only (read-only)                       | `spec`               |
+| Auto Off    | Prompts before edits/commands (per-tool)    | `normal`             |
+| Auto Low    | Low-risk operations (basic file operations) | `auto-low`           |
+| Auto Medium | Development operations                      | `auto-medium`        |
+| Auto High   | Production operations (dangerous)           | `auto-high`          |
 
 ## Available Models
 
