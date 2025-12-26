@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
-import { findDroidExecutable, type Logger } from "./utils.ts";
+import { findDroidExecutable, isWindows, type Logger } from "./utils.ts";
 import type {
   DroidAutonomyLevel,
   DroidNotification,
@@ -394,6 +394,9 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
           ...globalThis.process.env,
           FORCE_COLOR: "0",
         },
+        // Windows compatibility
+        shell: isWindows,
+        windowsHide: true,
       });
 
       if (process.stdout) {

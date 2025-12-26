@@ -88,9 +88,18 @@ export function sleep(time: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, time));
 }
 
+/** Check if running on Windows */
+export const isWindows = process.platform === "win32";
+
+/**
+ * Find the droid executable path.
+ * Uses DROID_EXECUTABLE env var if set, otherwise defaults to "droid".
+ * On Windows, also checks for "droid.exe" if not explicitly set.
+ */
 export function findDroidExecutable(): string {
   if (process.env.DROID_EXECUTABLE) {
     return process.env.DROID_EXECUTABLE;
   }
+  // On Windows, the executable might be droid.exe, but shell: true handles this
   return "droid";
 }

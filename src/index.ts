@@ -11,7 +11,7 @@ process.on("unhandledRejection", (reason, promise) => {
 
 import { spawn } from "node:child_process";
 import { runAcp } from "./acp-agent.ts";
-import { findDroidExecutable } from "./utils.ts";
+import { findDroidExecutable, isWindows } from "./utils.ts";
 
 /**
  * Run droid with native ACP mode (--output-format acp).
@@ -28,6 +28,10 @@ function runNativeAcp(): void {
   const droid = spawn(executable, args, {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, FORCE_COLOR: "0" },
+    // Windows requires shell: true for proper command execution
+    shell: isWindows,
+    // Windows-specific: hide the console window
+    windowsHide: true,
   });
 
   process.stdin.pipe(droid.stdin);
@@ -46,8 +50,12 @@ function runNativeAcp(): void {
     process.exit(code ?? 0);
   });
 
-  process.on("SIGTERM", () => droid.kill("SIGTERM"));
-  process.on("SIGINT", () => droid.kill("SIGINT"));
+  // Signal handling (works on Unix, limited on Windows)
+  process.on("SIGTERM", () => droid.kill());
+  process.on("SIGINT", () => droid.kill());
+  if (isWindows) {
+    process.on("SIGHUP", () => droid.kill());
+  }
 }
 
 // Parse command line arguments

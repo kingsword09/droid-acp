@@ -13,5 +13,5 @@ export type {
   AvailableModel,
   InitSessionResult,
 } from "./types.ts";
-export { Pushable, findDroidExecutable } from "./utils.ts";
+export { Pushable, findDroidExecutable, isWindows } from "./utils.ts";
 export type { Logger } from "./utils.ts";
