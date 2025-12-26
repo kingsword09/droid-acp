@@ -106,6 +106,33 @@ Add to your Zed `settings.json`:
 
 - `FACTORY_API_KEY` - Your Factory API key (required)
 - `DROID_EXECUTABLE` - Path to the droid binary (optional, defaults to `droid` in PATH)
+- `DROID_ACP_WEBSEARCH` - Enable local proxy to optionally intercept Droid websearch (`/api/tools/exa/search`)
+- `DROID_ACP_WEBSEARCH_FORWARD_URL` - Optional forward target for websearch (base URL or full URL)
+- `DROID_ACP_WEBSEARCH_FORWARD_MODE` - Forward mode for `DROID_ACP_WEBSEARCH_FORWARD_URL` (`http` or `mcp`, default: `http`)
+- `DROID_ACP_WEBSEARCH_UPSTREAM_URL` - Optional upstream Factory API base URL (default: `FACTORY_API_BASE_URL_OVERRIDE` or `https://api.factory.ai`)
+- `DROID_ACP_WEBSEARCH_HOST` - Optional proxy bind host (default: `127.0.0.1`)
+- `DROID_ACP_WEBSEARCH_PORT` - Optional proxy bind port (default: random available port)
+
+- `SMITHERY_API_KEY` - Optional (recommended) Smithery Exa MCP API key (enables high-quality websearch)
+- `SMITHERY_PROFILE` - Optional Smithery Exa MCP profile id
+
+### WebSearch Proxy (optional)
+
+If you want to route Droid's websearch requests (`POST /api/tools/exa/search`) to your own handler:
+
+```bash
+DROID_ACP_WEBSEARCH=1 \
+DROID_ACP_WEBSEARCH_FORWARD_URL="http://127.0.0.1:20002" \
+npx droid-acp
+```
+
+If you want to use Smithery Exa (MCP) like `droid-patch`, set:
+
+```bash
+export SMITHERY_API_KEY="your_smithery_key"
+export SMITHERY_PROFILE="your_profile_id"
+DROID_ACP_WEBSEARCH=1 npx droid-acp
+```
 
 ## Session Modes
 

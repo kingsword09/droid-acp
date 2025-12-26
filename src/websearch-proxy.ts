@@ -1,0 +1,345 @@
+import { createServer } from "node:http";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { AddressInfo } from "node:net";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Logger } from "./utils.ts";
+
+export interface WebsearchProxyOptions {
+  upstreamBaseUrl: string;
+  websearchForwardUrl?: string;
+  websearchForwardMode?: "http" | "mcp";
+  smitheryApiKey?: string;
+  smitheryProfile?: string;
+  host?: string;
+  port?: number;
+  logger?: Logger;
+}
+
+export interface WebsearchProxyHandle {
+  baseUrl: string;
+  close: () => Promise<void>;
+}
+
+function parseHttpUrl(value: string, name: string): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${name} must be a valid URL: ${value}`);
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`${name} must be http(s): ${value}`);
+  }
+
+  return url;
+}
+
+function resolveForwardTarget(forward: URL, requestPathAndQuery: string): URL {
+  // If the forward URL looks like a base (no explicit path), keep the request path.
+  if (forward.pathname === "/" && forward.search === "" && forward.hash === "") {
+    return new URL(requestPathAndQuery, forward);
+  }
+
+  // Otherwise treat it as a full URL, but preserve the query string if caller didn't set one.
+  const target = new URL(forward.toString());
+  if (!target.search && requestPathAndQuery.includes("?")) {
+    target.search = requestPathAndQuery.slice(requestPathAndQuery.indexOf("?"));
+  }
+  return target;
+}
+
+function isBodylessMethod(method: string | undefined): boolean {
+  return method === "GET" || method === "HEAD";
+}
+
+function toNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+async function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+    total += buf.length;
+    if (total > maxBytes) {
+      throw new Error(`Request body too large (${total} bytes)`);
+    }
+    chunks.push(buf);
+  }
+
+  return Buffer.concat(chunks);
+}
+
+async function tryHandleWebsearchWithMcp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  logger: Logger,
+  mcpEndpoint: URL,
+  bodyBuffer: Buffer,
+): Promise<boolean> {
+  let input: unknown;
+  try {
+    input = JSON.parse(bodyBuffer.toString("utf8"));
+  } catch {
+    return false;
+  }
+
+  const query = toNonEmptyString((input as { query?: unknown } | null | undefined)?.query);
+  const numResultsRaw = (input as { numResults?: unknown } | null | undefined)?.numResults;
+  const numResults =
+    typeof numResultsRaw === "number" && Number.isFinite(numResultsRaw) ? Math.max(1, numResultsRaw) : 10;
+
+  if (!query) return false;
+
+  const requestBody = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: {
+      name: "web_search_exa",
+      arguments: {
+        query,
+        numResults,
+      },
+    },
+  };
+
+  let mcpResponse: unknown;
+  try {
+    const response = await fetch(mcpEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+
+    mcpResponse = await response.json();
+  } catch (error: unknown) {
+    logger.error("[websearch] MCP request failed:", error);
+    return false;
+  }
+
+  const resultContent = (mcpResponse as { result?: { content?: unknown } } | null | undefined)?.result
+    ?.content;
+  const contentBlocks = Array.isArray(resultContent) ? (resultContent as Array<unknown>) : [];
+  const textBlock = contentBlocks.find(
+    (c): c is { type: string; text: string } =>
+      !!c &&
+      typeof c === "object" &&
+      (c as { type?: unknown }).type === "text" &&
+      typeof (c as { text?: unknown }).text === "string",
+  );
+
+  if (!textBlock) {
+    const errorMessage = (mcpResponse as { error?: { message?: unknown } } | null | undefined)?.error
+      ?.message;
+    logger.error("[websearch] MCP response missing text content:", errorMessage ?? mcpResponse);
+    return false;
+  }
+
+  let parsedResults: unknown;
+  try {
+    parsedResults = JSON.parse(textBlock.text);
+  } catch (error: unknown) {
+    logger.error("[websearch] Failed to parse MCP text payload:", error);
+    return false;
+  }
+
+  if (!Array.isArray(parsedResults)) {
+    logger.error("[websearch] MCP text payload is not an array");
+    return false;
+  }
+
+  const results = (parsedResults as Array<Record<string, unknown>>).slice(0, numResults).map((item) => {
+    const title = toNonEmptyString(item.title) ?? "";
+    const url = toNonEmptyString(item.url) ?? "";
+    const highlights = Array.isArray(item.highlights)
+      ? (item.highlights as unknown[]).filter((v): v is string => typeof v === "string")
+      : [];
+    const content =
+      toNonEmptyString(item.text) ?? toNonEmptyString(item.snippet) ?? (highlights.length > 0 ? highlights.join(" ") : "");
+
+    return {
+      title,
+      url,
+      content,
+      snippet: content,
+      publishedDate: item.publishedDate ?? null,
+      author: item.author ?? null,
+      score: item.score ?? null,
+    };
+  });
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ results }));
+  return true;
+}
+
+export async function startWebsearchProxy(options: WebsearchProxyOptions): Promise<WebsearchProxyHandle> {
+  const logger = options.logger ?? console;
+  const host = options.host ?? "127.0.0.1";
+  const port = options.port ?? 0;
+
+  const upstreamBase = parseHttpUrl(options.upstreamBaseUrl, "DROID_ACP_WEBSEARCH_UPSTREAM_URL");
+  const forward = options.websearchForwardUrl
+    ? parseHttpUrl(options.websearchForwardUrl, "DROID_ACP_WEBSEARCH_FORWARD_URL")
+    : null;
+  const forwardMode = options.websearchForwardMode ?? "http";
+
+  const smitheryApiKey = toNonEmptyString(options.smitheryApiKey);
+  const smitheryProfile = toNonEmptyString(options.smitheryProfile);
+  const smitheryEndpoint =
+    smitheryApiKey && smitheryProfile
+      ? new URL(
+          `https://server.smithery.ai/exa/mcp?api_key=${encodeURIComponent(
+            smitheryApiKey,
+          )}&profile=${encodeURIComponent(smitheryProfile)}`,
+        )
+      : null;
+
+  const server = createServer((req, res) => {
+    void (async () => {
+      const rawUrl = req.url;
+      if (!rawUrl) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Missing URL" }));
+        return;
+      }
+
+      const requestUrl = new URL(rawUrl, `http://${req.headers.host ?? "127.0.0.1"}`);
+      const pathAndQuery = `${requestUrl.pathname}${requestUrl.search || ""}`;
+
+      if (requestUrl.pathname === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            status: "ok",
+            upstreamBaseUrl: upstreamBase.toString(),
+            websearchForwardUrl: forward?.toString() ?? null,
+          }),
+        );
+        return;
+      }
+
+      const isWebsearch = requestUrl.pathname === "/api/tools/exa/search" && req.method === "POST";
+      const shouldUseForwardForWebsearch = isWebsearch && forward && forwardMode === "http";
+      const targetUrl = shouldUseForwardForWebsearch
+        ? resolveForwardTarget(forward, pathAndQuery)
+        : new URL(pathAndQuery, upstreamBase);
+
+      const headers = new Headers();
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (value === undefined) continue;
+        if (key.toLowerCase() === "host") continue;
+        if (Array.isArray(value)) {
+          for (const v of value) headers.append(key, v);
+        } else {
+          headers.set(key, value);
+        }
+      }
+
+      const controller = new AbortController();
+      req.on("aborted", () => controller.abort());
+
+      let bodyBuffer: Buffer | null = null;
+      if (isWebsearch) {
+        try {
+          bodyBuffer = await readBody(req, 1_000_000);
+        } catch {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Request body too large" }));
+          return;
+        }
+
+        // Mode 1: forward as MCP to a custom MCP endpoint.
+        if (forward && forwardMode === "mcp") {
+          logger.log("[websearch] MCP forward enabled:", forward.toString());
+          if (await tryHandleWebsearchWithMcp(req, res, logger, forward, bodyBuffer)) return;
+        }
+
+        // Mode 2: Smithery Exa MCP (env-driven), compatible with droid-patch.
+        if (smitheryEndpoint) {
+          logger.log("[websearch] Smithery Exa MCP enabled");
+          if (await tryHandleWebsearchWithMcp(req, res, logger, smitheryEndpoint, bodyBuffer)) return;
+        }
+
+        logger.log("[websearch] proxying", pathAndQuery, "->", targetUrl.toString());
+      } else {
+        logger.log("[factory-proxy]", req.method ?? "GET", pathAndQuery);
+      }
+
+      let upstreamResponse: Response;
+      try {
+        upstreamResponse = await fetch(targetUrl, {
+          method: req.method,
+          headers,
+          body:
+            isBodylessMethod(req.method) ? undefined : bodyBuffer ? bodyBuffer : req,
+          redirect: "manual",
+          signal: controller.signal,
+          // Required by undici when streaming request bodies.
+          duplex: "half",
+        } as RequestInit);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Upstream request failed", message }));
+        return;
+      }
+
+      const setCookie: string[] | undefined = (upstreamResponse.headers as unknown as {
+        getSetCookie?: () => string[];
+      }).getSetCookie?.();
+      if (setCookie && setCookie.length > 0) {
+        res.setHeader("set-cookie", setCookie);
+      }
+
+      for (const [key, value] of upstreamResponse.headers) {
+        if (key.toLowerCase() === "set-cookie") continue;
+        res.setHeader(key, value);
+      }
+
+      res.statusCode = upstreamResponse.status;
+
+      if (!upstreamResponse.body) {
+        res.end();
+        return;
+      }
+
+      try {
+        await pipeline(Readable.fromWeb(upstreamResponse.body), res);
+      } catch {
+        // Connection ended; nothing to do.
+      }
+    })();
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("Failed to bind websearch proxy server");
+  }
+  const actualPort = (address as AddressInfo).port;
+  const baseUrl = `http://${host}:${actualPort}`;
+
+  logger.log("[websearch] proxy listening on", baseUrl);
+
+  return {
+    baseUrl,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      }),
+  };
+}

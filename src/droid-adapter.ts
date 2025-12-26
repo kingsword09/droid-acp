@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { findDroidExecutable, isWindows, type Logger } from "./utils.ts";
+import { startWebsearchProxy, type WebsearchProxyHandle } from "./websearch-proxy.ts";
 import type {
   DroidAutonomyLevel,
   DroidNotification,
@@ -37,6 +38,7 @@ export interface DroidAdapter {
 export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
   let process: ChildProcess | null = null;
   let sessionId: string | null = null;
+  let websearchProxy: WebsearchProxyHandle | null = null;
   const machineId = randomUUID();
   const logger = options.logger ?? console;
 
@@ -374,6 +376,13 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
     }
   };
 
+  const stopWebsearchProxy = () => {
+    if (!websearchProxy) return;
+    const proxy = websearchProxy;
+    websearchProxy = null;
+    proxy.close().catch((err: unknown) => logger.error("[websearch] proxy close failed:", err));
+  };
+
   return {
     async start(): Promise<InitSessionResult> {
       const executable = findDroidExecutable();
@@ -388,12 +397,67 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
       ];
 
       logger.log("Starting droid:", executable, args.join(" "));
+
+      const env: NodeJS.ProcessEnv = {
+        ...globalThis.process.env,
+        FORCE_COLOR: "0",
+      };
+
+      const isEnvEnabled = (value: string | undefined): boolean => {
+        if (!value) return false;
+        switch (value.trim().toLowerCase()) {
+          case "1":
+          case "true":
+          case "yes":
+          case "on":
+            return true;
+          default:
+            return false;
+        }
+      };
+
+      if (isEnvEnabled(env.DROID_ACP_WEBSEARCH)) {
+        stopWebsearchProxy();
+
+        const upstreamBaseUrl =
+          env.DROID_ACP_WEBSEARCH_UPSTREAM_URL ??
+          env.FACTORY_API_BASE_URL_OVERRIDE ??
+          "https://api.factory.ai";
+        const websearchForwardUrl = env.DROID_ACP_WEBSEARCH_FORWARD_URL;
+        const forwardModeRaw = env.DROID_ACP_WEBSEARCH_FORWARD_MODE;
+        const websearchForwardMode =
+          typeof forwardModeRaw === "string" && forwardModeRaw.trim().toLowerCase() === "mcp"
+            ? ("mcp" as const)
+            : ("http" as const);
+        const host = env.DROID_ACP_WEBSEARCH_HOST ?? "127.0.0.1";
+
+        const portRaw = env.DROID_ACP_WEBSEARCH_PORT;
+        let port: number | undefined;
+        if (typeof portRaw === "string" && portRaw.length > 0) {
+          const parsed = Number.parseInt(portRaw, 10);
+          if (Number.isNaN(parsed) || parsed < 0 || parsed > 65535) {
+            throw new Error(`Invalid DROID_ACP_WEBSEARCH_PORT: ${portRaw}`);
+          }
+          port = parsed;
+        }
+
+        websearchProxy = await startWebsearchProxy({
+          upstreamBaseUrl,
+          websearchForwardUrl,
+          websearchForwardMode,
+          smitheryApiKey: env.SMITHERY_API_KEY,
+          smitheryProfile: env.SMITHERY_PROFILE,
+          host,
+          port,
+          logger,
+        });
+
+        env.FACTORY_API_BASE_URL_OVERRIDE = websearchProxy.baseUrl;
+      }
+
       process = spawn(executable, args, {
         stdio: ["pipe", "pipe", "pipe"],
-        env: {
-          ...globalThis.process.env,
-          FORCE_COLOR: "0",
-        },
+        env,
         // Windows compatibility
         shell: isWindows,
         windowsHide: true,
@@ -414,6 +478,7 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
       process.on("exit", (code) => {
         logger.log("Droid exit:", code);
         process = null;
+        stopWebsearchProxy();
         exitHandlers.forEach((h) => h(code));
       });
 
@@ -490,6 +555,7 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
         process.kill("SIGTERM");
         process = null;
       }
+      stopWebsearchProxy();
     },
 
     isRunning() {
