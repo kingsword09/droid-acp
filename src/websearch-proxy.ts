@@ -5,6 +5,45 @@ import type { AddressInfo } from "node:net";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Logger } from "./utils.ts";
 
+function parseSseJsonPayload(raw: string): unknown {
+  const lines = raw.split(/\r?\n/);
+  let currentData: string[] = [];
+  const flush = (acc: unknown[]): void => {
+    if (currentData.length === 0) return;
+    const joined = currentData.join("\n");
+    try {
+      acc.push(JSON.parse(joined));
+    } catch {
+      // Ignore non-JSON events.
+    }
+    currentData = [];
+  };
+
+  const parsed: unknown[] = [];
+  for (const line of lines) {
+    if (line.length === 0) {
+      flush(parsed);
+      continue;
+    }
+
+    if (line.startsWith("event:")) {
+      continue;
+    }
+
+    if (line.startsWith("data:")) {
+      const data = line.slice("data:".length).replace(/^ /, "");
+      currentData.push(data);
+      continue;
+    }
+
+    // Ignore other SSE fields.
+  }
+  flush(parsed);
+
+  // Prefer the last JSON payload (often the final message).
+  return parsed.length > 0 ? parsed[parsed.length - 1] : null;
+}
+
 export interface WebsearchProxyOptions {
   upstreamBaseUrl: string;
   websearchForwardUrl?: string;
@@ -94,6 +133,36 @@ async function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer>
   return Buffer.concat(chunks);
 }
 
+function parseSearchResultsText(text: string, numResults: number): Array<Record<string, unknown>> | null {
+  // First try JSON (some MCP servers return an array encoded in text).
+  try {
+    const json = JSON.parse(text) as unknown;
+    if (Array.isArray(json)) return (json as Array<Record<string, unknown>>).slice(0, numResults);
+  } catch {
+    // Fall through to plain-text parsing.
+  }
+
+  // Fallback: Smithery Exa MCP often returns plain text blocks:
+  // Title: ...
+  // URL: ...
+  // Text: ...
+  const matches = [...text.matchAll(/^Title:\s*(.*)$/gm)];
+  if (matches.length === 0) return null;
+
+  const results: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < matches.length && results.length < numResults; i += 1) {
+    const start = matches[i]?.index ?? 0;
+    const end = matches[i + 1]?.index ?? text.length;
+    const chunk = text.slice(start, end).trim();
+    const title = matches[i]?.[1]?.trim() ?? "";
+    const url = (chunk.match(/^URL:\s*(.*)$/m)?.[1] ?? "").trim();
+    const snippet = (chunk.match(/^Text:\s*(.*)$/m)?.[1] ?? "").trim();
+    results.push({ title, url, snippet, text: snippet });
+  }
+
+  return results;
+}
+
 async function tryHandleWebsearchWithMcp(
   res: ServerResponse,
   logger: Logger,
@@ -121,11 +190,25 @@ async function tryHandleWebsearchWithMcp(
   try {
     const response = await fetch(mcpEndpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        // Smithery requires the client to accept both JSON and SSE.
+        Accept: "application/json, text/event-stream",
+      },
       body: JSON.stringify(requestBody),
     });
 
-    mcpResponse = await response.json();
+    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+    if (contentType.includes("text/event-stream")) {
+      const raw = await response.text();
+      const parsedSse = parseSseJsonPayload(raw);
+      if (!parsedSse) {
+        throw new Error("Invalid MCP SSE response: missing JSON payload");
+      }
+      mcpResponse = parsedSse;
+    } else {
+      mcpResponse = await response.json();
+    }
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     logger.error("[websearch] MCP request failed:", message);
@@ -154,21 +237,13 @@ async function tryHandleWebsearchWithMcp(
     return { handled: false, error: message };
   }
 
-  let parsedResults: unknown;
-  try {
-    parsedResults = JSON.parse(textBlock.text);
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error("[websearch] Failed to parse MCP text payload:", message);
-    return { handled: false, error: `Invalid MCP payload: ${message}` };
+  const parsedItems = parseSearchResultsText(textBlock.text, numResults);
+  if (!parsedItems) {
+    logger.error("[websearch] Failed to parse MCP text payload");
+    return { handled: false, error: "Invalid MCP payload: unsupported format" };
   }
 
-  if (!Array.isArray(parsedResults)) {
-    logger.error("[websearch] MCP text payload is not an array");
-    return { handled: false, error: "Invalid MCP payload: expected array" };
-  }
-
-  const results = (parsedResults as Array<Record<string, unknown>>).slice(0, numResults).map((item) => {
+  const results = parsedItems.slice(0, numResults).map((item) => {
     const title = toNonEmptyString(item.title) ?? "";
     const url = toNonEmptyString(item.url) ?? "";
     const highlights = Array.isArray(item.highlights)
