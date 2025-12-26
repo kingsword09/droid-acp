@@ -215,8 +215,14 @@ export async function startWebsearchProxy(options: WebsearchProxyOptions): Promi
         )
       : null;
 
+  let totalRequests = 0;
+  let websearchRequests = 0;
+  let lastWebsearchAt: string | null = null;
+  let lastWebsearchOutcome: string | null = null;
+
   const server = createServer((req, res) => {
     void (async () => {
+      totalRequests += 1;
       const rawUrl = req.url;
       if (!rawUrl) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -236,12 +242,19 @@ export async function startWebsearchProxy(options: WebsearchProxyOptions): Promi
             websearchForwardUrl: forward?.toString() ?? null,
             websearchForwardMode: forwardMode,
             smitheryEnabled: Boolean(smitheryEndpoint),
+            requests: {
+              total: totalRequests,
+              websearch: websearchRequests,
+              lastWebsearchAt,
+              lastWebsearchOutcome,
+            },
           }),
         );
         return;
       }
 
-      const isWebsearch = requestUrl.pathname === "/api/tools/exa/search" && req.method === "POST";
+      const isWebsearchPath = requestUrl.pathname.startsWith("/api/tools/exa/search");
+      const isWebsearch = isWebsearchPath && req.method === "POST";
       const shouldUseForwardForWebsearch = isWebsearch && forward && forwardMode === "http";
       const targetUrl = shouldUseForwardForWebsearch
         ? resolveForwardTarget(forward, pathAndQuery)
@@ -263,27 +276,37 @@ export async function startWebsearchProxy(options: WebsearchProxyOptions): Promi
 
       let bodyBuffer: Buffer | null = null;
       if (isWebsearch) {
+        websearchRequests += 1;
+        lastWebsearchAt = new Date().toISOString();
         try {
           bodyBuffer = await readBody(req, 1_000_000);
         } catch {
           res.writeHead(413, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Request body too large" }));
+          lastWebsearchOutcome = "rejected: body too large";
           return;
         }
 
         // Mode 1: forward as MCP to a custom MCP endpoint.
         if (forward && forwardMode === "mcp") {
           const r = await tryHandleWebsearchWithMcp(res, logger, forward, bodyBuffer);
-          if (r.handled) return;
+          if (r.handled) {
+            lastWebsearchOutcome = "handled: mcp forward";
+            return;
+          }
           res.writeHead(502, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "WebSearch MCP forward failed", message: r.error ?? "Unknown error" }));
+          lastWebsearchOutcome = `error: mcp forward (${r.error ?? "unknown"})`;
           return;
         }
 
         // Mode 2: Smithery Exa MCP (env-driven), compatible with droid-patch.
         if (smitheryEndpoint) {
           const r = await tryHandleWebsearchWithMcp(res, logger, smitheryEndpoint, bodyBuffer);
-          if (r.handled) return;
+          if (r.handled) {
+            lastWebsearchOutcome = "handled: smithery exa mcp";
+            return;
+          }
           res.writeHead(502, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
@@ -291,10 +314,12 @@ export async function startWebsearchProxy(options: WebsearchProxyOptions): Promi
               message: r.error ?? "Unknown error",
             }),
           );
+          lastWebsearchOutcome = `error: smithery exa mcp (${r.error ?? "unknown"})`;
           return;
         }
 
         logger.log("[websearch] proxying", pathAndQuery, "->", targetUrl.toString());
+        lastWebsearchOutcome = "proxied: upstream";
       } else {
         logger.log("[factory-proxy]", req.method ?? "GET", pathAndQuery);
       }
