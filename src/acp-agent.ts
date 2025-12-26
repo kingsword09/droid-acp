@@ -28,7 +28,7 @@ import {
   type DroidPermissionOption,
   type PermissionRequest,
 } from "./types.ts";
-import { type Logger, nodeToWebReadable, nodeToWebWritable } from "./utils.ts";
+import { isEnvEnabled, type Logger, nodeToWebReadable, nodeToWebWritable } from "./utils.ts";
 
 const nodeRequire = createRequire(import.meta.url);
 const packageJson = nodeRequire("../package.json") as {
@@ -247,6 +247,41 @@ export class DroidAcpAgent implements Agent {
 
     this.sessions.set(sessionId, session);
     this.logger.log("Session created:", sessionId);
+
+    // Help diagnose Zed env + websearch proxy wiring (only emits when relevant env is set).
+    const shouldEmitWebsearchStatus =
+      isEnvEnabled(process.env.DROID_ACP_WEBSEARCH) ||
+      Boolean(process.env.DROID_ACP_WEBSEARCH_FORWARD_URL) ||
+      Boolean(process.env.SMITHERY_API_KEY) ||
+      Boolean(process.env.SMITHERY_PROFILE);
+    if (shouldEmitWebsearchStatus) {
+      const websearchProxyBaseUrl = droid.getWebsearchProxyBaseUrl();
+      setTimeout(() => {
+        void this.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text:
+                [
+                  "[droid-acp] WebSearch 状态",
+                  `- DROID_ACP_WEBSEARCH: ${process.env.DROID_ACP_WEBSEARCH ?? "<unset>"}`,
+                  `- DROID_ACP_WEBSEARCH_PORT: ${process.env.DROID_ACP_WEBSEARCH_PORT ?? "<unset>"}`,
+                  `- DROID_ACP_WEBSEARCH_FORWARD_MODE: ${process.env.DROID_ACP_WEBSEARCH_FORWARD_MODE ?? "<unset>"}`,
+                  `- DROID_ACP_WEBSEARCH_FORWARD_URL: ${process.env.DROID_ACP_WEBSEARCH_FORWARD_URL ?? "<unset>"}`,
+                  `- SMITHERY_API_KEY: ${process.env.SMITHERY_API_KEY ? "set" : "<unset>"}`,
+                  `- SMITHERY_PROFILE: ${process.env.SMITHERY_PROFILE ? "set" : "<unset>"}`,
+                  `- proxyBaseUrl: ${websearchProxyBaseUrl ?? "<not running>"}`,
+                  websearchProxyBaseUrl ? `- health: ${websearchProxyBaseUrl}/health` : null,
+                ]
+                  .filter((l): l is string => typeof l === "string")
+                  .join("\n") + "\n",
+            },
+          },
+        });
+      }, 0);
+    }
 
     // Send available commands update after session response
     setTimeout(() => {

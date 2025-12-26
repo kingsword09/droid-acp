@@ -58,6 +58,26 @@ function toNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function parseWebsearchRequestBody(bodyBuffer: Buffer): { query: string; numResults: number } | null {
+  let input: unknown;
+  try {
+    input = JSON.parse(bodyBuffer.toString("utf8"));
+  } catch {
+    return null;
+  }
+
+  const query = toNonEmptyString((input as { query?: unknown } | null | undefined)?.query);
+  if (!query) return null;
+
+  const numResultsRaw = (input as { numResults?: unknown } | null | undefined)?.numResults;
+  const numResults =
+    typeof numResultsRaw === "number" && Number.isFinite(numResultsRaw)
+      ? Math.max(1, numResultsRaw)
+      : 10;
+
+  return { query, numResults };
+}
+
 async function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -75,25 +95,14 @@ async function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer>
 }
 
 async function tryHandleWebsearchWithMcp(
-  req: IncomingMessage,
   res: ServerResponse,
   logger: Logger,
   mcpEndpoint: URL,
   bodyBuffer: Buffer,
-): Promise<boolean> {
-  let input: unknown;
-  try {
-    input = JSON.parse(bodyBuffer.toString("utf8"));
-  } catch {
-    return false;
-  }
-
-  const query = toNonEmptyString((input as { query?: unknown } | null | undefined)?.query);
-  const numResultsRaw = (input as { numResults?: unknown } | null | undefined)?.numResults;
-  const numResults =
-    typeof numResultsRaw === "number" && Number.isFinite(numResultsRaw) ? Math.max(1, numResultsRaw) : 10;
-
-  if (!query) return false;
+): Promise<{ handled: boolean; error?: string }> {
+  const parsed = parseWebsearchRequestBody(bodyBuffer);
+  if (!parsed) return { handled: false };
+  const { query, numResults } = parsed;
 
   const requestBody = {
     jsonrpc: "2.0",
@@ -118,8 +127,9 @@ async function tryHandleWebsearchWithMcp(
 
     mcpResponse = await response.json();
   } catch (error: unknown) {
-    logger.error("[websearch] MCP request failed:", error);
-    return false;
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error("[websearch] MCP request failed:", message);
+    return { handled: false, error: message };
   }
 
   const resultContent = (mcpResponse as { result?: { content?: unknown } } | null | undefined)?.result
@@ -134,23 +144,28 @@ async function tryHandleWebsearchWithMcp(
   );
 
   if (!textBlock) {
-    const errorMessage = (mcpResponse as { error?: { message?: unknown } } | null | undefined)?.error
-      ?.message;
-    logger.error("[websearch] MCP response missing text content:", errorMessage ?? mcpResponse);
-    return false;
+    const errorMessage =
+      (mcpResponse as { error?: { message?: unknown } } | null | undefined)?.error?.message ??
+      (mcpResponse as { error?: unknown } | null | undefined)?.error ??
+      null;
+    const message =
+      typeof errorMessage === "string" ? errorMessage : `Invalid MCP response: ${JSON.stringify(mcpResponse)}`;
+    logger.error("[websearch] MCP response missing text content:", message);
+    return { handled: false, error: message };
   }
 
   let parsedResults: unknown;
   try {
     parsedResults = JSON.parse(textBlock.text);
   } catch (error: unknown) {
-    logger.error("[websearch] Failed to parse MCP text payload:", error);
-    return false;
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error("[websearch] Failed to parse MCP text payload:", message);
+    return { handled: false, error: `Invalid MCP payload: ${message}` };
   }
 
   if (!Array.isArray(parsedResults)) {
     logger.error("[websearch] MCP text payload is not an array");
-    return false;
+    return { handled: false, error: "Invalid MCP payload: expected array" };
   }
 
   const results = (parsedResults as Array<Record<string, unknown>>).slice(0, numResults).map((item) => {
@@ -175,7 +190,7 @@ async function tryHandleWebsearchWithMcp(
 
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ results }));
-  return true;
+  return { handled: true };
 }
 
 export async function startWebsearchProxy(options: WebsearchProxyOptions): Promise<WebsearchProxyHandle> {
@@ -219,6 +234,8 @@ export async function startWebsearchProxy(options: WebsearchProxyOptions): Promi
             status: "ok",
             upstreamBaseUrl: upstreamBase.toString(),
             websearchForwardUrl: forward?.toString() ?? null,
+            websearchForwardMode: forwardMode,
+            smitheryEnabled: Boolean(smitheryEndpoint),
           }),
         );
         return;
@@ -256,14 +273,25 @@ export async function startWebsearchProxy(options: WebsearchProxyOptions): Promi
 
         // Mode 1: forward as MCP to a custom MCP endpoint.
         if (forward && forwardMode === "mcp") {
-          logger.log("[websearch] MCP forward enabled:", forward.toString());
-          if (await tryHandleWebsearchWithMcp(req, res, logger, forward, bodyBuffer)) return;
+          const r = await tryHandleWebsearchWithMcp(res, logger, forward, bodyBuffer);
+          if (r.handled) return;
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "WebSearch MCP forward failed", message: r.error ?? "Unknown error" }));
+          return;
         }
 
         // Mode 2: Smithery Exa MCP (env-driven), compatible with droid-patch.
         if (smitheryEndpoint) {
-          logger.log("[websearch] Smithery Exa MCP enabled");
-          if (await tryHandleWebsearchWithMcp(req, res, logger, smitheryEndpoint, bodyBuffer)) return;
+          const r = await tryHandleWebsearchWithMcp(res, logger, smitheryEndpoint, bodyBuffer);
+          if (r.handled) return;
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "Smithery Exa MCP websearch failed",
+              message: r.error ?? "Unknown error",
+            }),
+          );
+          return;
         }
 
         logger.log("[websearch] proxying", pathAndQuery, "->", targetUrl.toString());

@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
-import { findDroidExecutable, isWindows, type Logger } from "./utils.ts";
+import { findDroidExecutable, isEnvEnabled, isWindows, type Logger } from "./utils.ts";
 import { startWebsearchProxy, type WebsearchProxyHandle } from "./websearch-proxy.ts";
 import type {
   DroidAutonomyLevel,
@@ -24,6 +24,7 @@ export interface DroidAdapter {
     text: string;
     images?: Array<{ type: "base64"; data: string; mediaType: string }>;
   }): void;
+  getWebsearchProxyBaseUrl(): string | null;
   setMode(level: DroidAutonomyLevel): void;
   setModel(modelId: string): void;
   onNotification(handler: (notification: DroidNotification) => void | Promise<void>): void;
@@ -403,19 +404,6 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
         FORCE_COLOR: "0",
       };
 
-      const isEnvEnabled = (value: string | undefined): boolean => {
-        if (!value) return false;
-        switch (value.trim().toLowerCase()) {
-          case "1":
-          case "true":
-          case "yes":
-          case "on":
-            return true;
-          default:
-            return false;
-        }
-      };
-
       if (isEnvEnabled(env.DROID_ACP_WEBSEARCH)) {
         stopWebsearchProxy();
 
@@ -453,6 +441,7 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
         });
 
         env.FACTORY_API_BASE_URL_OVERRIDE = websearchProxy.baseUrl;
+        env.FACTORY_API_BASE_URL = websearchProxy.baseUrl;
       }
 
       process = spawn(executable, args, {
@@ -515,6 +504,10 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
         params.images = message.images;
       }
       send("droid.add_user_message", params);
+    },
+
+    getWebsearchProxyBaseUrl(): string | null {
+      return websearchProxy?.baseUrl ?? null;
     },
 
     setMode(level: DroidAutonomyLevel) {

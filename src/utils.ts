@@ -88,6 +88,19 @@ export function sleep(time: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, time));
 }
 
+export function isEnvEnabled(value: string | undefined): boolean {
+  if (!value) return false;
+  switch (value.trim().toLowerCase()) {
+    case "1":
+    case "true":
+    case "yes":
+    case "on":
+      return true;
+    default:
+      return false;
+  }
+}
+
 /** Check if running on Windows */
 export const isWindows = process.platform === "win32";
 
