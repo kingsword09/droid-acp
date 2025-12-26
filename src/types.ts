@@ -2,13 +2,20 @@
  * Factory API types for stream-jsonrpc protocol
  */
 
-export type AutonomyLevel = "suggest" | "normal" | "full";
+// ACP mode ids exposed to the client (Zed).
+export type AcpModeId = "off" | "low" | "medium" | "high" | "spec";
+export const ACP_MODES: AcpModeId[] = ["off", "low", "medium", "high", "spec"];
 
-export const ACP_TO_DROID_MODE: Record<string, AutonomyLevel> = {
-  low: "suggest",
-  medium: "normal",
-  high: "full",
-};
+// Droid `autonomyLevel` values (see Factory docs: Settings → autonomyLevel).
+export type DroidAutonomyLevel =
+  | "normal"
+  | "spec"
+  | "auto-low"
+  | "auto-medium"
+  | "auto-high"
+  // legacy values (keep for compatibility with older CLIs)
+  | "suggest"
+  | "full";
 
 export interface FactoryRequest {
   jsonrpc: "2.0";
@@ -66,7 +73,17 @@ export interface InitSessionResult {
 
 export type DroidNotification =
   | { type: "working_state"; state: "idle" | "streaming_assistant_message" }
-  | { type: "tool_result"; toolUseId: string; content: string }
+  | {
+      type: "settings_updated";
+      settings: {
+        modelId?: string;
+        reasoningEffort?: string;
+        autonomyLevel?: string;
+        specModeModelId?: string;
+        specModeReasoningEffort?: string;
+      };
+    }
+  | { type: "tool_result"; toolUseId: string; content: string; isError: boolean }
   | {
       type: "message";
       role: "user" | "assistant" | "system";
@@ -76,6 +93,11 @@ export type DroidNotification =
     }
   | { type: "error"; message: string }
   | { type: "complete" };
+
+export interface DroidPermissionOption {
+  value: string;
+  label: string;
+}
 
 export interface PermissionRequest {
   toolUses?: Array<{
@@ -88,9 +110,12 @@ export interface PermissionRequest {
         [key: string]: unknown;
       };
     };
+    confirmationType?: string;
+    details?: unknown;
   }>;
+  options?: DroidPermissionOption[];
 }
 
 export interface PermissionResponse {
-  selectedOption: "proceed_once" | "proceed_always" | "cancel";
+  selectedOption: string;
 }

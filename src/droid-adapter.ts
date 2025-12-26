@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { findDroidExecutable, type Logger } from "./utils.ts";
 import type {
-  AutonomyLevel,
+  DroidAutonomyLevel,
   DroidNotification,
   FactoryRequest,
   FactoryMessage,
@@ -19,7 +19,11 @@ export interface DroidAdapterOptions {
 export interface DroidAdapter {
   start(): Promise<InitSessionResult>;
   sendMessage(text: string): void;
-  setMode(level: AutonomyLevel): void;
+  sendUserMessage(message: {
+    text: string;
+    images?: Array<{ type: "base64"; data: string; mediaType: string }>;
+  }): void;
+  setMode(level: DroidAutonomyLevel): void;
   setModel(modelId: string): void;
   onNotification(handler: (notification: DroidNotification) => void | Promise<void>): void;
   onRawEvent(handler: (event: unknown) => void | Promise<void>): void;
@@ -48,6 +52,7 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
   // State for message ordering (handle out-of-order idle notification)
   let isStreamingAssistant = false;
   let pendingIdle = false;
+  let pendingIdleTimer: NodeJS.Timeout | null = null;
 
   const send = (method: string, params: Record<string, unknown>) => {
     if (!process?.stdin?.writable) return;
@@ -123,6 +128,33 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
         const notificationType = notification.type as string;
 
         switch (notificationType) {
+          case "settings_updated": {
+            const settings = notification.settings as Record<string, unknown> | undefined;
+            if (settings) {
+              await emit({
+                type: "settings_updated",
+                settings: {
+                  modelId: typeof settings.modelId === "string" ? settings.modelId : undefined,
+                  reasoningEffort:
+                    typeof settings.reasoningEffort === "string"
+                      ? settings.reasoningEffort
+                      : undefined,
+                  autonomyLevel:
+                    typeof settings.autonomyLevel === "string" ? settings.autonomyLevel : undefined,
+                  specModeModelId:
+                    typeof settings.specModeModelId === "string"
+                      ? settings.specModeModelId
+                      : undefined,
+                  specModeReasoningEffort:
+                    typeof settings.specModeReasoningEffort === "string"
+                      ? settings.specModeReasoningEffort
+                      : undefined,
+                },
+              });
+            }
+            break;
+          }
+
           case "droid_working_state_changed": {
             const newState = notification.newState as string;
             await emit({
@@ -133,11 +165,29 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
             if (newState === "streaming_assistant_message") {
               isStreamingAssistant = true;
               pendingIdle = false;
+              if (pendingIdleTimer) {
+                clearTimeout(pendingIdleTimer);
+                pendingIdleTimer = null;
+              }
             } else if (newState === "idle") {
               // Handle out-of-order idle notification
               // Droid CLI sometimes sends idle before the final assistant message
               if (isStreamingAssistant) {
                 pendingIdle = true;
+
+                // Droid can also transition through streaming→idle without emitting a final
+                // assistant create_message (e.g. after rejecting ExitSpecMode). In that case,
+                // ensure we still complete the prompt after a short grace period.
+                if (pendingIdleTimer) {
+                  clearTimeout(pendingIdleTimer);
+                }
+                pendingIdleTimer = setTimeout(() => {
+                  if (!pendingIdle) return;
+                  pendingIdle = false;
+                  isStreamingAssistant = false;
+                  pendingIdleTimer = null;
+                  void emit({ type: "complete" });
+                }, 250);
               } else {
                 await emit({ type: "complete" });
               }
@@ -153,36 +203,67 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
                 type: string;
                 text?: string;
                 id?: string;
+                toolUseId?: string;
+                tool_use_id?: string;
+                tool_call_id?: string;
+                callId?: string;
+                call_id?: string;
                 name?: string;
+                toolName?: string;
+                tool_name?: string;
                 input?: unknown;
               }>;
             };
             if (message) {
-              const textContent = message.content?.find((c) => c.type === "text");
-              const toolUseContent = message.content?.find((c) => c.type === "tool_use");
+              const blocks = Array.isArray(message.content) ? message.content : [];
 
-              if (textContent || toolUseContent) {
+              const textParts = blocks
+                .filter((c) => c.type === "text" && typeof c.text === "string")
+                .map((c) => c.text as string);
+
+              if (textParts.length > 0) {
                 await emit({
                   type: "message",
                   role: message.role as "user" | "assistant" | "system",
-                  text: textContent?.text,
+                  text: textParts.join(""),
                   id: message.id,
-                  toolUse: toolUseContent
-                    ? {
-                        id: toolUseContent.id || randomUUID(),
-                        name: toolUseContent.name || "unknown",
-                        input: toolUseContent.input,
-                      }
-                    : undefined,
                 });
+              }
 
-                // If we were waiting for this assistant message, now complete
-                if (message.role === "assistant") {
-                  isStreamingAssistant = false;
-                  if (pendingIdle) {
-                    await emit({ type: "complete" });
-                    pendingIdle = false;
-                  }
+              const toolUses = blocks.filter((c) => c.type === "tool_use");
+              for (const toolUseContent of toolUses) {
+                const id =
+                  toolUseContent.id ??
+                  toolUseContent.toolUseId ??
+                  toolUseContent.tool_use_id ??
+                  toolUseContent.tool_call_id ??
+                  toolUseContent.callId ??
+                  toolUseContent.call_id ??
+                  randomUUID();
+                const name =
+                  toolUseContent.name ?? toolUseContent.toolName ?? toolUseContent.tool_name;
+                await emit({
+                  type: "message",
+                  role: message.role as "user" | "assistant" | "system",
+                  id: message.id,
+                  toolUse: {
+                    id,
+                    name: name || "unknown",
+                    input: toolUseContent.input,
+                  },
+                });
+              }
+
+              // If we were waiting for this assistant message, now complete
+              if (message.role === "assistant") {
+                isStreamingAssistant = false;
+                if (pendingIdleTimer) {
+                  clearTimeout(pendingIdleTimer);
+                  pendingIdleTimer = null;
+                }
+                if (pendingIdle) {
+                  await emit({ type: "complete" });
+                  pendingIdle = false;
                 }
               }
             }
@@ -190,10 +271,37 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
           }
 
           case "tool_result": {
+            const toolUseIdRaw =
+              (notification as Record<string, unknown>).toolUseId ??
+              (notification as Record<string, unknown>).tool_use_id ??
+              (notification as Record<string, unknown>).tool_call_id ??
+              (notification as Record<string, unknown>).callId ??
+              (notification as Record<string, unknown>).call_id ??
+              (notification as Record<string, unknown>).id;
+            const toolUseId = typeof toolUseIdRaw === "string" ? toolUseIdRaw : null;
+
+            const rawContent =
+              (notification as Record<string, unknown>).content ??
+              (notification as Record<string, unknown>).value;
+            const content =
+              typeof rawContent === "string"
+                ? rawContent
+                : JSON.stringify(rawContent ?? "", null, 2);
+
+            const isErrorRaw =
+              (notification as Record<string, unknown>).isError ??
+              (notification as Record<string, unknown>).is_error;
+            const isError = typeof isErrorRaw === "boolean" ? isErrorRaw : false;
+
+            if (!toolUseId) {
+              logger.error("Missing tool_use_id/toolUseId for tool_result notification");
+              break;
+            }
             await emit({
               type: "tool_result",
-              toolUseId: notification.toolUseId as string,
-              content: notification.content as string,
+              toolUseId,
+              content,
+              isError,
             });
             break;
           }
@@ -201,7 +309,11 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
           case "error": {
             isStreamingAssistant = false;
             pendingIdle = false;
-            await emit({ type: "error", message: notification.message as string });
+            const message =
+              typeof notification.message === "string"
+                ? (notification.message as string)
+                : JSON.stringify(notification.message ?? "Unknown error");
+            await emit({ type: "error", message });
             break;
           }
         }
@@ -319,15 +431,29 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
     },
 
     sendMessage(text: string) {
-      if (!sessionId) return;
-      send("droid.add_user_message", { sessionId, text });
+      this.sendUserMessage({ text });
     },
 
-    setMode(level: AutonomyLevel) {
+    sendUserMessage(message: {
+      text: string;
+      images?: Array<{ type: "base64"; data: string; mediaType: string }>;
+    }) {
+      if (!sessionId) return;
+      const params: Record<string, unknown> = {
+        sessionId,
+        text: message.text,
+      };
+      if (Array.isArray(message.images) && message.images.length > 0) {
+        params.images = message.images;
+      }
+      send("droid.add_user_message", params);
+    },
+
+    setMode(level: DroidAutonomyLevel) {
       if (!sessionId) return;
       send("droid.update_session_settings", {
         sessionId,
-        settings: { autonomyLevel: level },
+        autonomyLevel: level,
       });
     },
 
@@ -335,7 +461,7 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
       if (!sessionId) return;
       send("droid.update_session_settings", {
         sessionId,
-        settings: { modelId },
+        modelId,
       });
     },
 
