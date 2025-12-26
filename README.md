@@ -32,12 +32,75 @@ npm install droid-acp
 ### Running
 
 ```bash
-droid-acp
+# Default mode (stream-jsonrpc, supports custom models)
+npx droid-acp
+
+# Native ACP mode (lighter, but no custom model support)
+npx droid-acp --acp
 ```
 
 ### With Zed Editor
 
-Configure Zed to use droid-acp as an external agent.
+Add to your Zed `settings.json`:
+
+```json
+{
+  "agent_servers": {
+    "Droid": {
+      "type": "custom",
+      "command": "npx",
+      "args": ["droid-acp"],
+      "env": {
+        "FACTORY_API_KEY": "fk-your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+**Using native ACP mode (no custom model support):**
+
+```json
+{
+  "agent_servers": {
+    "Droid Native": {
+      "type": "custom",
+      "command": "npx",
+      "args": ["droid-acp", "--acp"],
+      "env": {
+        "FACTORY_API_KEY": "fk-your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+**Using a custom droid binary (e.g., patched version):**
+
+```json
+{
+  "agent_servers": {
+    "Droid Custom": {
+      "type": "custom",
+      "command": "npx",
+      "args": ["droid-acp"],
+      "env": {
+        "FACTORY_API_KEY": "fk-your-api-key-here",
+        "DROID_EXECUTABLE": "/path/to/custom/droid"
+      }
+    }
+  }
+}
+```
+
+### Modes
+
+| Command | Mode | Custom Models | Description |
+|---------|------|---------------|-------------|
+| `npx droid-acp` | stream-jsonrpc | ✅ Supported | Default, recommended |
+| `npx droid-acp --acp` | native ACP | ❌ Not supported | Lighter, direct pipe to droid |
+
+> **Note:** Native ACP mode (`--acp`) has a limitation in droid where custom models configured in `~/.factory/config.json` are not recognized. Use the default stream-jsonrpc mode if you need custom models.
 
 ### Environment Variables
 
