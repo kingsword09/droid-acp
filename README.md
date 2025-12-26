@@ -95,10 +95,10 @@ Add to your Zed `settings.json`:
 
 ### Modes
 
-| Command | Mode | Custom Models | Description |
-|---------|------|---------------|-------------|
-| `npx droid-acp` | stream-jsonrpc | ✅ Supported | Default, recommended |
-| `npx droid-acp --acp` | native ACP | ❌ Not supported | Lighter, direct pipe to droid |
+| Command               | Mode           | Custom Models    | Description                   |
+| --------------------- | -------------- | ---------------- | ----------------------------- |
+| `npx droid-acp`       | stream-jsonrpc | ✅ Supported     | Default, recommended          |
+| `npx droid-acp --acp` | native ACP     | ❌ Not supported | Lighter, direct pipe to droid |
 
 > **Note:** Native ACP mode (`--acp`) has a limitation in droid where custom models configured in `~/.factory/config.json` are not recognized. Use the default stream-jsonrpc mode if you need custom models.
 
