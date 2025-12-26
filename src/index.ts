@@ -76,6 +76,12 @@ function runNativeAcp(): void {
       logger: console,
     });
 
+    // Droid requires an auth header for tool calls (including websearch) and will error early if missing.
+    // Since websearch is intercepted by the local proxy, any non-empty value is sufficient here.
+    if (!env.FACTORY_API_KEY) {
+      env.FACTORY_API_KEY = "droid-acp-websearch";
+    }
+
     env.FACTORY_API_BASE_URL_OVERRIDE = websearchProxy.baseUrl;
     env.FACTORY_API_BASE_URL = websearchProxy.baseUrl;
   };
