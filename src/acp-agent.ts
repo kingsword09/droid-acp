@@ -46,22 +46,14 @@ function normalizeBase64DataUrl(
   return { mimeType: fallbackMimeType, base64: trimmed.replace(/\s+/g, "") };
 }
 
-// Available slash commands for Droid
+// Available slash commands for ACP adapter
+// Note: Only commands that can be implemented via Droid's JSON-RPC API are supported.
+// CLI-only commands (clear, compact, sessions, etc.) don't have API equivalents.
 function getAvailableCommands(): AvailableCommand[] {
   return [
     {
       name: "help",
-      description: "Show available commands and usage information",
-      input: null,
-    },
-    {
-      name: "clear",
-      description: "Clear the current conversation context",
-      input: null,
-    },
-    {
-      name: "compact",
-      description: "Compact conversation history to reduce token usage",
+      description: "Show available slash commands",
       input: null,
     },
     {
@@ -71,8 +63,8 @@ function getAvailableCommands(): AvailableCommand[] {
     },
     {
       name: "mode",
-      description: "Show or change the autonomy mode",
-      input: { hint: "[off|low|medium|high|spec]" },
+      description: "Show or change the autonomy mode (off|low|medium|high|spec)",
+      input: { hint: "[mode]" },
     },
     {
       name: "config",
@@ -81,7 +73,7 @@ function getAvailableCommands(): AvailableCommand[] {
     },
     {
       name: "status",
-      description: "Show session status and statistics",
+      description: "Show current session status",
       input: null,
     },
   ];
@@ -551,14 +543,13 @@ export class DroidAcpAgent implements Agent {
         return true;
       }
 
-      case "clear":
-      case "compact":
-        // Pass these commands to Droid as they may be supported
-        return false;
-
       default:
-        // Unknown command, pass to Droid
-        return false;
+        // Unknown command - show error
+        await this.sendAgentMessage(
+          session,
+          `Unknown command: \`/${command}\`. Type \`/help\` to see available commands.`,
+        );
+        return true;
     }
   }
 
