@@ -248,12 +248,10 @@ export class DroidAcpAgent implements Agent {
     this.sessions.set(sessionId, session);
     this.logger.log("Session created:", sessionId);
 
-    // Help diagnose Zed env + websearch proxy wiring (only emits when relevant env is set).
+    // Optional diagnostics for Zed env + websearch proxy wiring.
+    // Enable with DROID_ACP_WEBSEARCH_DEBUG=1 (or DROID_DEBUG=1).
     const shouldEmitWebsearchStatus =
-      isEnvEnabled(process.env.DROID_ACP_WEBSEARCH) ||
-      Boolean(process.env.DROID_ACP_WEBSEARCH_FORWARD_URL) ||
-      Boolean(process.env.SMITHERY_API_KEY) ||
-      Boolean(process.env.SMITHERY_PROFILE);
+      isEnvEnabled(process.env.DROID_ACP_WEBSEARCH_DEBUG) || isEnvEnabled(process.env.DROID_DEBUG);
     if (shouldEmitWebsearchStatus) {
       const websearchProxyBaseUrl = droid.getWebsearchProxyBaseUrl();
       const parentFactoryApiKey = process.env.FACTORY_API_KEY;
