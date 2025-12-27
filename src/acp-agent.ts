@@ -38,6 +38,7 @@ import {
 import {
   listFactorySessions,
   readFactorySessionStart,
+  type FactorySessionRecord,
   type FactorySessionSettings,
   resolveFactorySessionJsonlPath,
   resolveFactorySessionSettingsJsonPath,
@@ -57,6 +58,8 @@ const packageJson = nodeRequire("../package.json") as {
 const DROID_CONTEXT_INDICATOR_MIN_TOKENS = 11_000;
 const DROID_CONTEXT_INDICATOR_MAX_TOKENS = 300_000;
 const DROID_CONTEXT_INDICATOR_MAX_TOKENS_ANTHROPIC = 200_000;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function isExperimentSessionsEnabled(): boolean {
   return isEnvEnabled(process.env.DROID_ACP_EXPERIMENT_SESSIONS);
@@ -156,7 +159,7 @@ function getAvailableCommands(): AvailableCommand[] {
     commands.push({
       name: "sessions",
       description: "List or load previous sessions (local Droid history)",
-      input: { hint: "[load <session_id>|all]" },
+      input: { hint: "[load <#|id_prefix|session_id>|all]" },
     });
   }
 
@@ -184,6 +187,10 @@ interface Session {
   cancelled: boolean;
   promptResolve: ((result: PromptResponse) => void) | null;
   capture: SessionCapture | null;
+  lastSessionsListing: {
+    scope: "cwd" | "all";
+    sessions: FactorySessionRecord[];
+  } | null;
   activeToolCallIds: Set<string>;
   toolCallStatus: Map<string, "pending" | "in_progress" | "completed" | "failed">;
   toolNames: Map<string, string>;
@@ -344,6 +351,7 @@ export class DroidAcpAgent implements Agent {
       cancelled: false,
       promptResolve: null,
       capture: null,
+      lastSessionsListing: null,
       activeToolCallIds: new Set(),
       toolCallStatus: new Map(),
       toolNames: new Map(),
@@ -1308,7 +1316,13 @@ export class DroidAcpAgent implements Agent {
         }
 
         const parts = trimmedArgs.split(/\s+/).filter((p) => p.length > 0);
-        const sub = parts[0]?.toLowerCase();
+        let sub = parts[0]?.toLowerCase();
+
+        // Shorthand: `/sessions 3` means `/sessions load 3` (from the last listing).
+        if (sub && /^\d+$/.test(sub)) {
+          parts.unshift("load");
+          sub = "load";
+        }
 
         if (!sub || sub === "list") {
           const { sessions } = await listFactorySessions({
@@ -1325,16 +1339,27 @@ export class DroidAcpAgent implements Agent {
             return true;
           }
 
-          const lines = sessions.map((s) => {
+          session.lastSessionsListing = { scope: "cwd", sessions };
+
+          const lines = sessions.map((s, i) => {
             const time = s.updatedAt ? ` — ${formatTimestampForDisplay(s.updatedAt)}` : "";
             const cleanedTitle = s.title ? sanitizeSessionTitle(s.title) : "";
             const title = cleanedTitle.length > 0 ? ` — ${cleanedTitle}` : "";
-            return `- ${s.sessionId}${title}${time}`;
+            return `${i + 1}. ${s.sessionId}${title}${time}`;
           });
 
           await this.sendAgentMessage(
             session,
-            [`**Sessions (${session.cwd})**`, "", ...lines, "", "Use: /sessions load <session_id>"]
+            [
+              `**Sessions (${session.cwd})**`,
+              "",
+              ...lines,
+              "",
+              "Use:",
+              "- /sessions load <#>",
+              "- /sessions <#>",
+              "- /sessions load <session_id_prefix>",
+            ]
               .join("\n")
               .trim(),
           );
@@ -1354,24 +1379,46 @@ export class DroidAcpAgent implements Agent {
             return true;
           }
 
-          const lines = sessions.map((s) => {
+          session.lastSessionsListing = { scope: "all", sessions };
+
+          const lines = sessions.map((s, i) => {
             const time = s.updatedAt ? ` — ${formatTimestampForDisplay(s.updatedAt)}` : "";
             const cleanedTitle = s.title ? sanitizeSessionTitle(s.title) : "";
             const title = cleanedTitle.length > 0 ? ` — ${cleanedTitle}` : "";
-            return `- ${s.sessionId} (${s.cwd})${title}${time}`;
+            return `${i + 1}. ${s.sessionId} (${s.cwd})${title}${time}`;
           });
 
           await this.sendAgentMessage(
             session,
-            ["**Recent Sessions**", "", ...lines, "", "Use: /sessions load <session_id>"]
+            [
+              "**Recent Sessions**",
+              "",
+              ...lines,
+              "",
+              "Use:",
+              "- /sessions load <#>",
+              "- /sessions <#>",
+              "- /sessions load <session_id_prefix>",
+            ]
               .join("\n")
               .trim(),
           );
           return true;
         }
 
-        if (sub === "load" && typeof parts[1] === "string" && parts[1].length > 0) {
-          const targetSessionId = parts[1];
+        if (sub === "load") {
+          const rawTarget = parts[1] ?? "";
+          if (rawTarget.length === 0) {
+            await this.sendAgentMessage(
+              session,
+              "Usage:\n\n- /sessions load <#>\n- /sessions load <session_id_prefix>\n- /sessions load <full_session_id>",
+            );
+            return true;
+          }
+
+          const targetSessionId = await this.resolveSessionLoadTarget(session, rawTarget);
+          if (!targetSessionId) return true;
+
           await this.sendAgentMessage(session, `Loading session: ${targetSessionId}…`);
 
           const jsonlPath = await resolveFactorySessionJsonlPath({
@@ -1433,7 +1480,7 @@ export class DroidAcpAgent implements Agent {
 
         await this.sendAgentMessage(
           session,
-          "Usage:\n\n- /sessions (list current cwd)\n- /sessions all (list global)\n- /sessions load <session_id>",
+          "Usage:\n\n- /sessions (list current cwd)\n- /sessions all (list global)\n- /sessions load <#|id_prefix|session_id>\n- /sessions <#>",
         );
         return true;
       }
@@ -1446,6 +1493,110 @@ export class DroidAcpAgent implements Agent {
         );
         return true;
     }
+  }
+
+  private async resolveSessionLoadTarget(
+    session: Session,
+    rawTarget: string,
+  ): Promise<string | null> {
+    const target = rawTarget.trim();
+    if (!target) return null;
+
+    const lower = target.toLowerCase();
+    if (lower === "last" || lower === "latest") {
+      const listing =
+        session.lastSessionsListing?.sessions ??
+        (await listFactorySessions({ cwd: session.cwd, cursor: null, pageSize: 20 })).sessions;
+
+      if (!session.lastSessionsListing) {
+        session.lastSessionsListing = { scope: "cwd", sessions: listing };
+      }
+
+      const first = listing[0];
+      if (!first) {
+        await this.sendAgentMessage(
+          session,
+          `No sessions found for:\n\n- cwd: ${session.cwd}\n\nTry: /sessions all`,
+        );
+        return null;
+      }
+
+      return first.sessionId;
+    }
+
+    if (/^\d+$/.test(target)) {
+      const index = Number.parseInt(target, 10);
+      if (!Number.isFinite(index) || index <= 0) {
+        await this.sendAgentMessage(session, `Invalid session index: ${target}`);
+        return null;
+      }
+
+      const listing =
+        session.lastSessionsListing?.sessions ??
+        (await listFactorySessions({ cwd: session.cwd, cursor: null, pageSize: 20 })).sessions;
+
+      if (!session.lastSessionsListing) {
+        session.lastSessionsListing = { scope: "cwd", sessions: listing };
+      }
+
+      const record = listing[index - 1];
+      if (!record) {
+        await this.sendAgentMessage(
+          session,
+          `Session index out of range: ${index}\n\nRun \`/sessions\` to refresh the list.`,
+        );
+        return null;
+      }
+
+      return record.sessionId;
+    }
+
+    if (UUID_RE.test(target)) return target;
+
+    const listing =
+      session.lastSessionsListing?.sessions ??
+      (await listFactorySessions({ cwd: session.cwd, cursor: null, pageSize: 20 })).sessions;
+
+    if (!session.lastSessionsListing) {
+      session.lastSessionsListing = { scope: "cwd", sessions: listing };
+    }
+
+    const matches = listing.filter((s) =>
+      s.sessionId.toLowerCase().startsWith(target.toLowerCase()),
+    );
+
+    if (matches.length === 1) return matches[0].sessionId;
+
+    if (matches.length === 0) {
+      await this.sendAgentMessage(
+        session,
+        `No session matches that id prefix: ${target}\n\nRun \`/sessions\` or \`/sessions all\` to list sessions.`,
+      );
+      return null;
+    }
+
+    const formatLine = (s: FactorySessionRecord): string => {
+      const idx = listing.findIndex((x) => x.sessionId === s.sessionId);
+      const n = idx >= 0 ? `${idx + 1}. ` : "";
+      const time = s.updatedAt ? ` — ${formatTimestampForDisplay(s.updatedAt)}` : "";
+      const cleanedTitle = s.title ? sanitizeSessionTitle(s.title) : "";
+      const title = cleanedTitle.length > 0 ? ` — ${cleanedTitle}` : "";
+      const cwdSuffix = session.lastSessionsListing?.scope === "all" ? ` (${s.cwd})` : "";
+      return `${n}${s.sessionId}${cwdSuffix}${title}${time}`;
+    };
+
+    const lines = matches.slice(0, 10).map(formatLine);
+    await this.sendAgentMessage(
+      session,
+      [
+        `Multiple sessions match that id prefix: ${target}`,
+        "",
+        ...lines.map((l) => `- ${l}`),
+        "",
+        "Use: /sessions load <#>",
+      ].join("\n"),
+    );
+    return null;
   }
 
   private extractSummaryText(text: string): string {
