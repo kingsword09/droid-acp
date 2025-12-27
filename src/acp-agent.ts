@@ -106,8 +106,8 @@ function normalizeBase64DataUrl(
 }
 
 // Available slash commands for ACP adapter
-// Note: Only commands that can be implemented via Droid's JSON-RPC API are supported.
-// CLI-only commands (clear, compact, sessions, etc.) don't have API equivalents.
+// Note: Most commands are implemented via Droid's JSON-RPC API, but a few are implemented
+// in the adapter itself (e.g. /context, /compress, /sessions).
 function getAvailableCommands(): AvailableCommand[] {
   const commands: AvailableCommand[] = [
     {
@@ -119,6 +119,16 @@ function getAvailableCommands(): AvailableCommand[] {
       name: "context",
       description: "Show token usage (context indicator) for this session",
       input: null,
+    },
+    {
+      name: "compress",
+      description: "Compress conversation history (summary + restart)",
+      input: { hint: "[optional instructions]" },
+    },
+    {
+      name: "compact",
+      description: "Alias for /compress",
+      input: { hint: "[optional instructions]" },
     },
     {
       name: "model",
@@ -153,6 +163,15 @@ function getAvailableCommands(): AvailableCommand[] {
   return commands;
 }
 
+interface SessionCapture {
+  purpose: "compress_summary";
+  buffer: string;
+  timeoutId: NodeJS.Timeout;
+  finalizeTimeoutId: NodeJS.Timeout | null;
+  resolve: (text: string) => void;
+  reject: (error: Error) => void;
+}
+
 interface Session {
   id: string;
   droid: DroidAdapter;
@@ -164,6 +183,7 @@ interface Session {
   mode: AcpModeId;
   cancelled: boolean;
   promptResolve: ((result: PromptResponse) => void) | null;
+  capture: SessionCapture | null;
   activeToolCallIds: Set<string>;
   toolCallStatus: Map<string, "pending" | "in_progress" | "completed" | "failed">;
   toolNames: Map<string, string>;
@@ -323,6 +343,7 @@ export class DroidAcpAgent implements Agent {
       mode: initialMode,
       cancelled: false,
       promptResolve: null,
+      capture: null,
       activeToolCallIds: new Set(),
       toolCallStatus: new Map(),
       toolNames: new Map(),
@@ -1098,6 +1119,105 @@ export class DroidAcpAgent implements Agent {
         return true;
       }
 
+      case "compress":
+      case "compact": {
+        if (!session.droid.isRunning()) {
+          await this.sendAgentMessage(session, "Droid is not running.");
+          return true;
+        }
+        if (session.capture) {
+          await this.sendAgentMessage(session, "Another operation is already in progress.");
+          return true;
+        }
+
+        const extra = trimmedArgs.length > 0 ? `\n\nExtra instructions: ${trimmedArgs}` : "";
+        const summaryPrompt = [
+          "Create a compact handoff summary of our conversation so far.",
+          "",
+          "Requirements:",
+          "- Keep it short and information-dense.",
+          "- Include: goal, current state, key decisions, important files/paths, and next TODOs.",
+          "- Do NOT include tool call logs, <system-reminder>, or <context> blocks.",
+          "- Output must be ONLY a single <summary>...</summary> block.",
+          extra,
+        ]
+          .join("\n")
+          .trim();
+
+        await this.sendAgentMessage(session, "Compressing conversation history…");
+
+        let summaryRaw: string;
+        try {
+          summaryRaw = await this.captureNextAssistantText(session, summaryPrompt, {
+            timeoutMs: 2 * 60 * 1000,
+          });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.sendAgentMessage(session, `Failed to generate summary: ${msg}`);
+          return true;
+        }
+
+        const summaryText = this.extractSummaryText(summaryRaw);
+        const cleanedSummary = sanitizeHistoryTextForDisplay(summaryText);
+        if (cleanedSummary.length === 0) {
+          await this.sendAgentMessage(
+            session,
+            "Compression failed: summary was empty. Try again with fewer instructions.",
+          );
+          return true;
+        }
+
+        const oldDroid = session.droid;
+        const oldMode = session.mode;
+        const oldModel = session.model;
+        const title = session.title;
+        const cwd = session.cwd;
+
+        await this.sendAgentMessage(
+          session,
+          "Starting a fresh Droid session with summary context…",
+        );
+
+        const newDroid = createDroidAdapter({ cwd, logger: this.logger });
+        const initResult = await newDroid.start();
+        const { session: newSession } = this.attachSession({
+          sessionId: session.id,
+          cwd,
+          droid: newDroid,
+          initResult,
+          title,
+        });
+
+        // Best-effort: preserve the current mode/model across the restart.
+        newSession.mode = oldMode;
+        newSession.droid.setMode(ACP_MODE_TO_DROID_AUTONOMY[oldMode]);
+        await this.client.sessionUpdate({
+          sessionId: newSession.id,
+          update: {
+            sessionUpdate: "current_mode_update",
+            currentModeId: oldMode,
+          },
+        });
+
+        if (newSession.availableModels.some((m) => m.id === oldModel)) {
+          newSession.model = oldModel;
+          newSession.droid.setModel(oldModel);
+        }
+
+        // Stop the old process after the new session is attached (so stale exit events are ignored).
+        await oldDroid.stop();
+
+        // Inject the compressed context on the next user message.
+        newSession.pendingHistoryContext = cleanedSummary;
+
+        await this.sendAgentMessage(
+          newSession,
+          "Compression complete.\n\nYour next message will automatically include the summary context.",
+        );
+
+        return true;
+      }
+
       case "model": {
         if (trimmedArgs) {
           // Change model
@@ -1326,6 +1446,44 @@ export class DroidAcpAgent implements Agent {
         );
         return true;
     }
+  }
+
+  private extractSummaryText(text: string): string {
+    const match = text.match(/<summary>([\s\S]*?)<\/summary>/i);
+    if (match) return match[1]?.trim() ?? "";
+    return text.trim();
+  }
+
+  private captureNextAssistantText(
+    session: Session,
+    prompt: string,
+    options?: { timeoutMs?: number },
+  ): Promise<string> {
+    if (session.capture) {
+      return Promise.reject(new Error("Capture already in progress"));
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeoutMs = options?.timeoutMs ?? 2 * 60 * 1000;
+      const timeoutId = setTimeout(() => {
+        if (!session.capture) return;
+        const capture = session.capture;
+        session.capture = null;
+        if (capture.finalizeTimeoutId) clearTimeout(capture.finalizeTimeoutId);
+        capture.reject(new Error("Timed out while waiting for summary"));
+      }, timeoutMs);
+
+      session.capture = {
+        purpose: "compress_summary",
+        buffer: "",
+        timeoutId,
+        finalizeTimeoutId: null,
+        resolve: (t: string) => resolve(t),
+        reject: (e: Error) => reject(e),
+      };
+
+      session.droid.sendUserMessage({ text: prompt });
+    });
   }
 
   private async sendAgentMessage(session: Session, text: string): Promise<void> {
@@ -2200,8 +2358,24 @@ export class DroidAcpAgent implements Agent {
 
       case "message":
         if (n.role === "assistant") {
+          const suppressAssistantOutput =
+            session.capture?.purpose === "compress_summary" &&
+            !isEnvEnabled(process.env.DROID_DEBUG);
+
+          if (session.capture && n.text) {
+            const capture = session.capture;
+            capture.buffer += n.text;
+
+            if (capture.purpose === "compress_summary" && /<\/summary>/i.test(capture.buffer)) {
+              session.capture = null;
+              clearTimeout(capture.timeoutId);
+              if (capture.finalizeTimeoutId) clearTimeout(capture.finalizeTimeoutId);
+              capture.resolve(capture.buffer);
+            }
+          }
+
           // Handle tool use in message
-          if (n.toolUse) {
+          if (n.toolUse && !suppressAssistantOutput) {
             if (n.toolUse.name === "TodoWrite") {
               const todos = (n.toolUse.input as { todos?: unknown })?.todos;
               if (Array.isArray(todos)) {
@@ -2287,7 +2461,7 @@ export class DroidAcpAgent implements Agent {
           }
 
           // Handle text content
-          if (n.text) {
+          if (n.text && !suppressAssistantOutput) {
             await this.client.sessionUpdate({
               sessionId: session.id,
               update: {
@@ -2341,6 +2515,13 @@ export class DroidAcpAgent implements Agent {
         break;
 
       case "error":
+        if (session.capture) {
+          const capture = session.capture;
+          session.capture = null;
+          clearTimeout(capture.timeoutId);
+          if (capture.finalizeTimeoutId) clearTimeout(capture.finalizeTimeoutId);
+          capture.reject(new Error(n.message));
+        }
         await this.client.sessionUpdate({
           sessionId: session.id,
           update: {
@@ -2355,6 +2536,18 @@ export class DroidAcpAgent implements Agent {
         break;
 
       case "complete":
+        if (session.capture) {
+          const capture = session.capture;
+          if (!capture.finalizeTimeoutId) {
+            capture.finalizeTimeoutId = setTimeout(() => {
+              if (session.capture !== capture) return;
+              session.capture = null;
+              clearTimeout(capture.timeoutId);
+              capture.resolve(capture.buffer);
+            }, 1000);
+          }
+          break;
+        }
         if (session.promptResolve) {
           session.promptResolve({ stopReason: "end_turn" });
           session.promptResolve = null;
