@@ -6,8 +6,14 @@ import {
   type AvailableCommand,
   type InitializeRequest,
   type InitializeResponse,
+  type LoadSessionRequest,
+  type LoadSessionResponse,
   type NewSessionRequest,
   type NewSessionResponse,
+  type ListSessionsRequest,
+  type ListSessionsResponse,
+  type ResumeSessionRequest,
+  type ResumeSessionResponse,
   type PromptRequest,
   type PromptResponse,
   type CancelNotification,
@@ -26,8 +32,15 @@ import {
   type DroidAutonomyLevel,
   type DroidNotification,
   type DroidPermissionOption,
+  type InitSessionResult,
   type PermissionRequest,
 } from "./types.ts";
+import {
+  listFactorySessions,
+  readFactorySessionStart,
+  resolveFactorySessionJsonlPath,
+  streamFactorySessionJsonl,
+} from "./factory-sessions.ts";
 import { isEnvEnabled, type Logger, nodeToWebReadable, nodeToWebWritable } from "./utils.ts";
 
 const nodeRequire = createRequire(import.meta.url);
@@ -149,7 +162,9 @@ export class DroidAcpAgent implements Agent {
     return {
       protocolVersion: 1,
       agentCapabilities: {
+        loadSession: true,
         promptCapabilities: { image: true, embeddedContext: true },
+        sessionCapabilities: { list: {}, resume: {} },
       },
       agentInfo: {
         name: packageJson.name,
@@ -177,18 +192,64 @@ export class DroidAcpAgent implements Agent {
     throw new Error(`Unknown auth method: ${request.methodId}`);
   }
 
-  async newSession(request: NewSessionRequest): Promise<NewSessionResponse> {
-    const cwd = request.cwd || process.cwd();
-    this.logger.log("newSession:", cwd);
+  private getInitialMode(initResult: InitSessionResult): AcpModeId {
+    return typeof initResult.settings?.autonomyLevel === "string"
+      ? (droidAutonomyToAcpModeId(initResult.settings.autonomyLevel) ?? "off")
+      : "off";
+  }
 
-    const droid = createDroidAdapter({ cwd, logger: this.logger });
-    const initResult = await droid.start();
+  private getModelsState(initResult: InitSessionResult): NonNullable<NewSessionResponse["models"]> {
+    return {
+      availableModels: initResult.availableModels.map((m) => ({
+        modelId: m.id,
+        name: m.displayName,
+      })),
+      currentModelId: initResult.settings?.modelId || "unknown",
+    };
+  }
 
-    const sessionId = initResult.sessionId;
-    const initialMode: AcpModeId =
-      typeof initResult.settings?.autonomyLevel === "string"
-        ? (droidAutonomyToAcpModeId(initResult.settings.autonomyLevel) ?? "off")
-        : "off";
+  private getModesState(currentModeId: AcpModeId): NonNullable<NewSessionResponse["modes"]> {
+    return {
+      currentModeId,
+      availableModes: [
+        {
+          id: "spec",
+          name: "Spec",
+          description: "Research and plan only - no code changes",
+        },
+        {
+          id: "off",
+          name: "Auto Off",
+          description: "Read-only mode - safe for reviewing planned changes without execution",
+        },
+        {
+          id: "low",
+          name: "Auto Low",
+          description: "Low-risk operations - file creation/modification, no system changes",
+        },
+        {
+          id: "medium",
+          name: "Auto Medium",
+          description: "Development operations - npm install, git commit, build commands",
+        },
+        {
+          id: "high",
+          name: "Auto High",
+          description: "Production operations - git push, deployments, database migrations",
+        },
+      ],
+    };
+  }
+
+  private attachSession(params: {
+    sessionId: string;
+    cwd: string;
+    droid: DroidAdapter;
+    initResult: InitSessionResult;
+  }): { session: Session; initialMode: AcpModeId } {
+    const { sessionId, cwd, droid, initResult } = params;
+
+    const initialMode = this.getInitialMode(initResult);
     const session: Session = {
       id: sessionId,
       droid,
@@ -296,46 +357,300 @@ export class DroidAcpAgent implements Agent {
       });
     }, 0);
 
+    return { session, initialMode };
+  }
+
+  async newSession(request: NewSessionRequest): Promise<NewSessionResponse> {
+    const cwd = request.cwd || process.cwd();
+    this.logger.log("newSession:", cwd);
+
+    const droid = createDroidAdapter({ cwd, logger: this.logger });
+    const initResult = await droid.start();
+
+    const sessionId = initResult.sessionId;
+    const { initialMode } = this.attachSession({ sessionId, cwd, droid, initResult });
+
     return {
       sessionId,
-      models: {
-        availableModels: initResult.availableModels.map((m) => ({
-          modelId: m.id,
-          name: m.displayName,
-        })),
-        currentModelId: initResult.settings?.modelId || "unknown",
-      },
-      modes: {
-        currentModeId: initialMode,
-        availableModes: [
-          {
-            id: "spec",
-            name: "Spec",
-            description: "Research and plan only - no code changes",
-          },
-          {
-            id: "off",
-            name: "Auto Off",
-            description: "Read-only mode - safe for reviewing planned changes without execution",
-          },
-          {
-            id: "low",
-            name: "Auto Low",
-            description: "Low-risk operations - file creation/modification, no system changes",
-          },
-          {
-            id: "medium",
-            name: "Auto Medium",
-            description: "Development operations - npm install, git commit, build commands",
-          },
-          {
-            id: "high",
-            name: "Auto High",
-            description: "Production operations - git push, deployments, database migrations",
-          },
-        ],
-      },
+      models: this.getModelsState(initResult),
+      modes: this.getModesState(initialMode),
     };
+  }
+
+  async loadSession(request: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const requestCwd = request.cwd || process.cwd();
+    this.logger.log("loadSession:", request.sessionId, requestCwd);
+
+    const existing = this.sessions.get(request.sessionId);
+    if (existing?.droid.isRunning()) {
+      return {
+        models: {
+          availableModels: existing.availableModels.map((m) => ({
+            modelId: m.id,
+            name: m.displayName,
+          })),
+          currentModelId: existing.model,
+        },
+        modes: this.getModesState(existing.mode),
+      };
+    }
+
+    if (existing) {
+      try {
+        await existing.droid.stop();
+      } catch {}
+      this.sessions.delete(request.sessionId);
+    }
+
+    const jsonlPath = await resolveFactorySessionJsonlPath({
+      sessionId: request.sessionId,
+      cwd: requestCwd,
+    });
+
+    const header = jsonlPath ? await readFactorySessionStart(jsonlPath) : null;
+    const cwd = header?.cwd ?? requestCwd;
+
+    const droid = createDroidAdapter({
+      cwd,
+      logger: this.logger,
+      resumeSessionId: request.sessionId,
+    });
+    const initResult = await droid.start();
+
+    if (initResult.sessionId !== request.sessionId) {
+      await droid.stop();
+      throw new Error(
+        `Failed to load session: expected ${request.sessionId} but got ${initResult.sessionId}`,
+      );
+    }
+
+    const { session, initialMode } = this.attachSession({
+      sessionId: request.sessionId,
+      cwd,
+      droid,
+      initResult,
+    });
+
+    if (jsonlPath) {
+      await this.replayHistoryFromJsonl(session, jsonlPath);
+    } else if (Array.isArray(initResult.session?.messages)) {
+      await this.replayHistoryFromInitMessages(session, initResult.session.messages);
+    } else {
+      throw new Error(`Session history not found for ${request.sessionId}`);
+    }
+
+    return {
+      models: this.getModelsState(initResult),
+      modes: this.getModesState(initialMode),
+    };
+  }
+
+  async unstable_listSessions(request: ListSessionsRequest): Promise<ListSessionsResponse> {
+    const { sessions, nextCursor } = await listFactorySessions({
+      cwd: request.cwd ?? null,
+      cursor: request.cursor ?? null,
+    });
+
+    return {
+      sessions: sessions.map((s) => ({
+        sessionId: s.sessionId,
+        cwd: s.cwd,
+        title: s.title,
+        updatedAt: s.updatedAt,
+      })),
+      nextCursor,
+    };
+  }
+
+  async unstable_resumeSession(request: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    const cwd = request.cwd || process.cwd();
+    this.logger.log("resumeSession:", request.sessionId, cwd);
+
+    const existing = this.sessions.get(request.sessionId);
+    if (existing?.droid.isRunning()) {
+      return {
+        models: {
+          availableModels: existing.availableModels.map((m) => ({
+            modelId: m.id,
+            name: m.displayName,
+          })),
+          currentModelId: existing.model,
+        },
+        modes: this.getModesState(existing.mode),
+      };
+    }
+
+    if (existing) {
+      try {
+        await existing.droid.stop();
+      } catch {}
+      this.sessions.delete(request.sessionId);
+    }
+
+    const droid = createDroidAdapter({
+      cwd,
+      logger: this.logger,
+      resumeSessionId: request.sessionId,
+    });
+    const initResult = await droid.start();
+
+    if (initResult.sessionId !== request.sessionId) {
+      await droid.stop();
+      throw new Error(
+        `Failed to resume session: expected ${request.sessionId} but got ${initResult.sessionId}`,
+      );
+    }
+
+    const { initialMode } = this.attachSession({
+      sessionId: request.sessionId,
+      cwd,
+      droid,
+      initResult,
+    });
+
+    return {
+      models: this.getModelsState(initResult),
+      modes: this.getModesState(initialMode),
+    };
+  }
+
+  private async replayHistoryFromJsonl(session: Session, jsonlPath: string): Promise<void> {
+    this.logger.log("Replaying session history from:", jsonlPath);
+
+    for await (const entry of streamFactorySessionJsonl(jsonlPath)) {
+      const record = entry as { type?: unknown; message?: unknown; id?: unknown };
+      if (record.type !== "message") continue;
+
+      const message = record.message as {
+        role?: unknown;
+        content?: unknown;
+      };
+      const role = message?.role;
+      const content = message?.content;
+      if (role !== "user" && role !== "assistant" && role !== "system") continue;
+      if (!Array.isArray(content)) continue;
+
+      const messageId = typeof record.id === "string" ? record.id : "message";
+      await this.replayHistoryMessage(session, {
+        role,
+        id: messageId,
+        content,
+      });
+    }
+  }
+
+  private async replayHistoryFromInitMessages(session: Session, messages: unknown[]): Promise<void> {
+    this.logger.log("Replaying session history from init result (messages):", messages.length);
+
+    for (const entry of messages) {
+      const message = entry as { role?: unknown; content?: unknown; id?: unknown };
+      const role = message?.role;
+      const content = message?.content;
+
+      if (role !== "user" && role !== "assistant" && role !== "system") continue;
+      if (!Array.isArray(content)) continue;
+
+      const id = typeof message.id === "string" ? message.id : "message";
+      await this.replayHistoryMessage(session, {
+        role,
+        id,
+        content,
+      });
+    }
+  }
+
+  private async replayHistoryMessage(
+    session: Session,
+    message: { role: "user" | "assistant" | "system"; id: string; content: unknown[] },
+  ): Promise<void> {
+    if (message.role === "user") {
+      for (const block of message.content) {
+        const b = block as Record<string, unknown>;
+        const blockType = b.type as string | undefined;
+        if (blockType === "tool_result") {
+          const toolUseId = b.tool_use_id ?? b.toolUseId ?? b.toolUseID ?? b.tool_call_id ?? b.id;
+          const contentValue = b.content ?? b.value;
+          const isError = b.is_error ?? b.isError;
+          if (typeof toolUseId === "string") {
+            await this.handleNotification(session, {
+              type: "tool_result",
+              toolUseId,
+              content:
+                typeof contentValue === "string" ? contentValue : JSON.stringify(contentValue ?? "", null, 2),
+              isError: typeof isError === "boolean" ? isError : false,
+            });
+          }
+          continue;
+        }
+
+        if (blockType === "text") {
+          const text = typeof b.text === "string" ? b.text : "";
+          if (text.length > 0) {
+            await this.client.sessionUpdate({
+              sessionId: session.id,
+              update: {
+                sessionUpdate: "user_message_chunk",
+                content: { type: "text", text },
+              },
+            });
+          }
+          continue;
+        }
+
+        if (blockType === "image") {
+          const source = b.source as { type?: unknown; data?: unknown } | undefined;
+          const data = typeof source?.data === "string" ? source.data : null;
+          const mimeType =
+            (typeof b.media_type === "string" ? b.media_type : null) ??
+            (typeof b.mediaType === "string" ? b.mediaType : null);
+          if (data && mimeType) {
+            await this.client.sessionUpdate({
+              sessionId: session.id,
+              update: {
+                sessionUpdate: "user_message_chunk",
+                content: { type: "image", data, mimeType },
+              },
+            });
+          }
+          continue;
+        }
+      }
+      return;
+    }
+
+    if (message.role === "assistant") {
+      const textParts = message.content
+        .filter((c) => (c as Record<string, unknown>)?.type === "text")
+        .map((c) => ((c as Record<string, unknown>)?.text as string) ?? "")
+        .filter((t) => typeof t === "string" && t.length > 0);
+
+      if (textParts.length > 0) {
+        await this.handleNotification(session, {
+          type: "message",
+          role: "assistant",
+          id: message.id,
+          text: textParts.join(""),
+        });
+      }
+
+      const toolUses = message.content.filter((c) => (c as Record<string, unknown>)?.type === "tool_use");
+      for (const toolUseContent of toolUses) {
+        const u = toolUseContent as Record<string, unknown>;
+        const toolId = u.id ?? u.toolUseId ?? u.tool_use_id ?? u.tool_call_id ?? u.callId ?? u.call_id;
+        const toolName = u.name ?? u.toolName ?? u.tool_name;
+        if (typeof toolId !== "string") continue;
+        await this.handleNotification(session, {
+          type: "message",
+          role: "assistant",
+          id: message.id,
+          toolUse: {
+            id: toolId,
+            name: typeof toolName === "string" ? toolName : "unknown",
+            input: u.input,
+          },
+        });
+      }
+    }
   }
 
   async prompt(request: PromptRequest): Promise<PromptResponse> {
