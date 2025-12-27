@@ -10,6 +10,7 @@ Use Droid from any [ACP-compatible](https://agentclientprotocol.com) clients suc
 - Tool calls
 - TODO lists
 - Image prompts (e.g. paste screenshots in Zed)
+- Context / token usage indicator (`/context`)
 - Multiple model support
 - Session modes (Spec, Manual, Auto Low/Medium/High)
 - Experimental: sessions/history (session list/load + `/sessions`)
@@ -227,6 +228,15 @@ Notes:
 - Session IDs are displayed as plain text for easy copy/paste.
 - Times shown in `/sessions` are displayed as `YYYY-MM-DD HH:mm:ss` in your local timezone.
 - Native ACP mode (`--acp`) does not support these helpers.
+
+## Context / Token Usage (`/context`)
+
+Some ACP clients don’t expose Droid’s built-in token usage indicator UI. Use `/context` to print the **last model call** context indicator (matching Droid’s TUI). droid-acp reads this from `~/.factory/logs/droid-log-single.log`.
+
+Notes:
+
+- `Total` is computed as `inputTokens + outputTokens + cacheReadTokens` (matching Droid’s internal “lastTokenUsage”).
+- The context % matches Droid’s TUI: `max=200000` for Anthropic models, otherwise `max=300000`.
 
 ## Session Modes
 
