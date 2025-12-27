@@ -12,10 +12,24 @@ export interface FactorySessionRecord {
   jsonlPath: string;
 }
 
+export interface FactorySessionSettings {
+  assistantActiveTimeMs?: number;
+  model?: string;
+  reasoningEffort?: string;
+  autonomyMode?: string;
+  tokenUsage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheCreationTokens?: number;
+    cacheReadTokens?: number;
+    thinkingTokens?: number;
+  };
+}
+
 const DEFAULT_PAGE_SIZE = 50;
 const HEADER_SCAN_BYTES = 8192;
 
-function getFactoryDir(): string {
+export function getFactoryDir(): string {
   return process.env.DROID_ACP_FACTORY_DIR ?? path.join(os.homedir(), ".factory");
 }
 
@@ -116,6 +130,75 @@ export async function resolveFactorySessionJsonlPath(params: {
   }
 
   return null;
+}
+
+export async function resolveFactorySessionSettingsJsonPath(params: {
+  sessionId: string;
+  cwd: string;
+}): Promise<string | null> {
+  const sessionsDir = getFactorySessionsDir();
+  const direct = path.join(
+    sessionsDir,
+    encodeCwdToFactorySessionsDirName(params.cwd),
+    `${params.sessionId}.settings.json`,
+  );
+  if (await pathExists(direct)) return direct;
+
+  // Fallback: scan all cwd directories (useful if the client passed a different cwd).
+  let dirents: Array<{ name: string; isDirectory?: () => boolean }> = [];
+  try {
+    dirents = (await fs.readdir(sessionsDir, { withFileTypes: true })) as typeof dirents;
+  } catch {
+    return null;
+  }
+
+  for (const d of dirents) {
+    if (typeof d.isDirectory === "function" && !d.isDirectory()) continue;
+    const candidate = path.join(sessionsDir, d.name, `${params.sessionId}.settings.json`);
+    if (await pathExists(candidate)) return candidate;
+  }
+
+  return null;
+}
+
+export async function readFactorySessionSettings(
+  settingsJsonPath: string,
+): Promise<FactorySessionSettings | null> {
+  try {
+    const raw = await fs.readFile(settingsJsonPath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return null;
+    const obj = parsed as Record<string, unknown>;
+
+    const tokenUsageRaw = obj.tokenUsage;
+    const tokenUsage =
+      tokenUsageRaw && typeof tokenUsageRaw === "object"
+        ? (tokenUsageRaw as Record<string, unknown>)
+        : null;
+
+    const toNumber = (v: unknown): number | undefined => {
+      if (typeof v !== "number") return undefined;
+      return Number.isFinite(v) ? v : undefined;
+    };
+
+    return {
+      assistantActiveTimeMs: toNumber(obj.assistantActiveTimeMs),
+      model: typeof obj.model === "string" ? obj.model : undefined,
+      reasoningEffort: typeof obj.reasoningEffort === "string" ? obj.reasoningEffort : undefined,
+      autonomyMode: typeof obj.autonomyMode === "string" ? obj.autonomyMode : undefined,
+      tokenUsage: tokenUsage
+        ? {
+            inputTokens: toNumber(tokenUsage.inputTokens),
+            outputTokens: toNumber(tokenUsage.outputTokens),
+            cacheCreationTokens: toNumber(tokenUsage.cacheCreationTokens),
+            cacheReadTokens: toNumber(tokenUsage.cacheReadTokens),
+            thinkingTokens: toNumber(tokenUsage.thinkingTokens),
+          }
+        : undefined,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export async function listFactorySessions(params: {
