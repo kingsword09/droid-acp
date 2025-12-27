@@ -350,12 +350,16 @@ export async function startWebsearchProxy(
       for (const [key, value] of Object.entries(req.headers)) {
         if (value === undefined) continue;
         if (key.toLowerCase() === "host") continue;
+        // Avoid forwarding compression negotiation headers. Node fetch may transparently decompress,
+        // which can lead to clients attempting a second decompression pass.
+        if (key.toLowerCase() === "accept-encoding") continue;
         if (Array.isArray(value)) {
           for (const v of value) headers.append(key, v);
         } else {
           headers.set(key, value);
         }
       }
+      headers.set("accept-encoding", "identity");
 
       const controller = new AbortController();
       req.on("aborted", () => controller.abort());
@@ -444,6 +448,8 @@ export async function startWebsearchProxy(
 
       for (const [key, value] of upstreamResponse.headers) {
         if (key.toLowerCase() === "set-cookie") continue;
+        if (key.toLowerCase() === "content-encoding") continue;
+        if (key.toLowerCase() === "content-length") continue;
         res.setHeader(key, value);
       }
 

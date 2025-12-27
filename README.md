@@ -11,6 +11,7 @@ Use Droid from any [ACP-compatible](https://agentclientprotocol.com) clients suc
 - TODO lists
 - Image prompts (e.g. paste screenshots in Zed)
 - Context / token usage indicator (`/context`)
+- Context compaction (`/compress`)
 - Multiple model support
 - Session modes (Spec, Manual, Auto Low/Medium/High)
 - Experimental: sessions/history (session list/load + `/sessions`)
@@ -198,6 +199,7 @@ Notes:
 
 - The proxy exposes `GET /health` on `proxyBaseUrl` (handy for troubleshooting).
 - When `DROID_ACP_WEBSEARCH=1`, droid-acp injects a dummy `FACTORY_API_KEY` into the spawned droid process if none is set, so WebSearch requests can reach the proxy even without Factory login.
+- The proxy forces `Accept-Encoding: identity` upstream and strips `content-encoding`/`content-length` when proxying to avoid Brotli decompression errors in some client setups.
 
 ## Sessions (History / Resume)
 
@@ -237,6 +239,20 @@ Notes:
 
 - `Total` is computed as `inputTokens + outputTokens + cacheReadTokens` (matching Droid’s internal “lastTokenUsage”).
 - The context % matches Droid’s TUI: `max=200000` for Anthropic models, otherwise `max=300000`.
+
+## Compress / Compact (`/compress`, `/compact`)
+
+Droid’s built-in `/compress` is TUI-only. In stream-jsonrpc mode, droid-acp implements an equivalent workflow:
+
+1. Ask Droid to generate a short `<summary>...</summary>` of the current conversation
+2. Restart the underlying Droid exec session
+3. Inject the summary as embedded context on your next message (so the new session continues with a smaller context)
+
+Notes:
+
+- This is an adapter-level feature; it is **not available** in native ACP mode (`npx droid-acp --acp`).
+- The generated summary is captured silently (it is not shown in the chat transcript) and will be appended to your next message as embedded context.
+- You can pass optional instructions: `/compress focus on current code changes and next steps`.
 
 ## Session Modes
 
