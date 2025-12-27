@@ -408,6 +408,11 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
         FORCE_COLOR: "0",
       };
 
+      const reasoningEffort = env.DROID_ACP_REASONING_EFFORT;
+      if (typeof reasoningEffort === "string" && reasoningEffort.trim().length > 0) {
+        args.push("--reasoning-effort", reasoningEffort.trim());
+      }
+
       if (isEnvEnabled(env.DROID_ACP_WEBSEARCH)) {
         stopWebsearchProxy();
 

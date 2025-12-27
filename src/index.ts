@@ -14,6 +14,24 @@ import { runAcp } from "./acp-agent.ts";
 import { findDroidExecutable, isEnvEnabled, isWindows } from "./utils.ts";
 import { startWebsearchProxy, type WebsearchProxyHandle } from "./websearch-proxy.ts";
 
+function pickArgValue(argv: string[], names: string[]): string | null {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i] ?? "";
+    for (const name of names) {
+      if (arg === name) {
+        const next = argv[i + 1] ?? "";
+        if (!next || next.startsWith("-")) return null;
+        return next;
+      }
+      if (arg.startsWith(`${name}=`)) {
+        const value = arg.slice(`${name}=`.length);
+        return value.length > 0 ? value : null;
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * Run droid with native ACP mode (--output-format acp).
  * Note: Native ACP mode does NOT support custom models due to a bug in droid.
@@ -23,10 +41,15 @@ function runNativeAcp(): void {
   const cwd = process.cwd();
   const args = ["exec", "--output-format", "acp", "--cwd", cwd];
 
+  const env: NodeJS.ProcessEnv = { ...process.env, FORCE_COLOR: "0" };
+
+  const reasoningEffort = env.DROID_ACP_REASONING_EFFORT;
+  if (typeof reasoningEffort === "string" && reasoningEffort.trim().length > 0) {
+    args.push("--reasoning-effort", reasoningEffort.trim());
+  }
+
   console.error(`[droid-acp] Starting droid with native ACP: ${executable} ${args.join(" ")}`);
   console.error("[droid-acp] WARNING: Native ACP mode does not support custom models!");
-
-  const env: NodeJS.ProcessEnv = { ...process.env, FORCE_COLOR: "0" };
 
   let websearchProxy: WebsearchProxyHandle | null = null;
   const stopWebsearchProxy = () => {
@@ -146,6 +169,11 @@ function runNativeAcp(): void {
 // Parse command line arguments
 const useNativeAcp = process.argv.includes("--acp");
 const enableExperimentSessions = process.argv.includes("--experiment-sessions");
+
+const reasoningEffort = pickArgValue(process.argv, ["--reasoning-effort", "-r"]);
+if (reasoningEffort) {
+  process.env.DROID_ACP_REASONING_EFFORT = reasoningEffort;
+}
 
 if (enableExperimentSessions) {
   process.env.DROID_ACP_EXPERIMENT_SESSIONS = "1";

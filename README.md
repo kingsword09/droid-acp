@@ -41,6 +41,9 @@ npm install droid-acp
 # Default mode (stream-jsonrpc, supports custom models)
 npx droid-acp
 
+# Set initial reasoning effort (passes through to `droid exec --reasoning-effort`)
+npx droid-acp --reasoning-effort high
+
 # Enable experimental sessions/history helpers
 npx droid-acp --experiment-sessions
 
@@ -150,6 +153,7 @@ Add to your Zed `settings.json`:
 - `DROID_EXECUTABLE` - Path to the droid binary (optional, defaults to `droid` in PATH)
 - `DROID_ACP_FACTORY_DIR` - Override Factory config dir (defaults to `~/.factory`)
 - `DROID_ACP_EXPERIMENT_SESSIONS` - Enable experimental sessions/history features (same as `--experiment-sessions`)
+- `DROID_ACP_REASONING_EFFORT` - Initial reasoning effort passed to `droid exec --reasoning-effort` (optional)
 
 - `DROID_ACP_WEBSEARCH` - Enable local proxy to optionally intercept Droid websearch (`/api/tools/exa/search`)
 - `DROID_ACP_WEBSEARCH_FORWARD_URL` - Optional forward target for websearch (base URL or full URL)
