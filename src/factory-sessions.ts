@@ -13,6 +13,7 @@ export interface FactorySessionRecord {
 }
 
 const DEFAULT_PAGE_SIZE = 50;
+const HEADER_SCAN_BYTES = 8192;
 
 function getFactoryDir(): string {
   return process.env.DROID_ACP_FACTORY_DIR ?? path.join(os.homedir(), ".factory");
@@ -42,7 +43,7 @@ export async function readFactorySessionStart(
 ): Promise<{ cwd: string | null; title: string | null } | null> {
   const handle = await fs.open(jsonlPath, "r");
   try {
-    const buffer = Buffer.alloc(8192);
+    const buffer = Buffer.alloc(HEADER_SCAN_BYTES);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     const chunk = buffer.toString("utf8", 0, bytesRead);
     const firstLine = chunk.split(/\r?\n/, 1)[0]?.trim();
@@ -58,6 +59,31 @@ export async function readFactorySessionStart(
     };
   } catch {
     return null;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function factorySessionHasMessages(jsonlPath: string): Promise<boolean> {
+  const handle = await fs.open(jsonlPath, "r");
+  try {
+    const buffer = Buffer.alloc(HEADER_SCAN_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead <= 0) return false;
+
+    const chunk = buffer.toString("utf8", 0, bytesRead);
+    const newlineIndex = chunk.indexOf("\n");
+    if (newlineIndex === -1) {
+      const stat = await handle.stat();
+      return stat.size > bytesRead;
+    }
+
+    if (chunk.slice(newlineIndex + 1).trim().length > 0) return true;
+
+    const stat = await handle.stat();
+    return stat.size > newlineIndex + 1;
+  } catch {
+    return false;
   } finally {
     await handle.close();
   }
@@ -95,11 +121,18 @@ export async function resolveFactorySessionJsonlPath(params: {
 export async function listFactorySessions(params: {
   cwd?: string | null;
   cursor?: string | null;
+  preferredCwd?: string | null;
   pageSize?: number;
+  includeEmpty?: boolean;
 }): Promise<{ sessions: FactorySessionRecord[]; nextCursor: string | null }> {
   const pageSize = params.pageSize ?? DEFAULT_PAGE_SIZE;
   const sessionsDir = getFactorySessionsDir();
   const cwdFilter = typeof params.cwd === "string" && params.cwd.length > 0 ? params.cwd : null;
+  const preferredCwd =
+    typeof params.preferredCwd === "string" && params.preferredCwd.length > 0
+      ? params.preferredCwd
+      : null;
+  const includeEmpty = params.includeEmpty === true;
 
   const scanDirs: string[] = [];
   if (cwdFilter) {
@@ -142,6 +175,7 @@ export async function listFactorySessions(params: {
       const cwd = header?.cwd ?? cwdFilter ?? "";
       if (cwd.length === 0) continue;
       if (cwdFilter && cwd !== cwdFilter) continue;
+      if (!includeEmpty && !(await factorySessionHasMessages(jsonlPath))) continue;
 
       records.push({
         sessionId,
@@ -154,6 +188,10 @@ export async function listFactorySessions(params: {
   }
 
   records.sort((a, b) => {
+    const aPreferred = preferredCwd !== null && a.cwd === preferredCwd;
+    const bPreferred = preferredCwd !== null && b.cwd === preferredCwd;
+    if (aPreferred !== bPreferred) return aPreferred ? -1 : 1;
+
     const aTime = a.updatedAt ? Date.parse(a.updatedAt) : 0;
     const bTime = b.updatedAt ? Date.parse(b.updatedAt) : 0;
     return bTime - aTime;

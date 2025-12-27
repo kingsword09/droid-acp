@@ -49,6 +49,10 @@ const packageJson = nodeRequire("../package.json") as {
   version: string;
 };
 
+function isExperimentSessionsEnabled(): boolean {
+  return isEnvEnabled(process.env.DROID_ACP_EXPERIMENT_SESSIONS);
+}
+
 function normalizeBase64DataUrl(
   data: string,
   fallbackMimeType: string,
@@ -68,7 +72,7 @@ function normalizeBase64DataUrl(
 // Note: Only commands that can be implemented via Droid's JSON-RPC API are supported.
 // CLI-only commands (clear, compact, sessions, etc.) don't have API equivalents.
 function getAvailableCommands(): AvailableCommand[] {
-  return [
+  const commands: AvailableCommand[] = [
     {
       name: "help",
       description: "Show available slash commands",
@@ -95,12 +99,25 @@ function getAvailableCommands(): AvailableCommand[] {
       input: null,
     },
   ];
+
+  if (isExperimentSessionsEnabled()) {
+    commands.push({
+      name: "sessions",
+      description: "List or load previous sessions (local Droid history)",
+      input: { hint: "[load <session_id>|all]" },
+    });
+  }
+
+  return commands;
 }
 
 interface Session {
   id: string;
   droid: DroidAdapter;
   droidSessionId: string;
+  title: string | null;
+  updatedAt: string | null;
+  pendingHistoryContext: string | null;
   model: string;
   mode: AcpModeId;
   cancelled: boolean;
@@ -159,12 +176,13 @@ export class DroidAcpAgent implements Agent {
 
   async initialize(_request: InitializeRequest): Promise<InitializeResponse> {
     this.logger.log("initialize");
+    const enableSessions = isExperimentSessionsEnabled();
     return {
       protocolVersion: 1,
       agentCapabilities: {
-        loadSession: true,
+        loadSession: enableSessions,
         promptCapabilities: { image: true, embeddedContext: true },
-        sessionCapabilities: { list: {}, resume: {} },
+        sessionCapabilities: enableSessions ? { list: {}, resume: {} } : {},
       },
       agentInfo: {
         name: packageJson.name,
@@ -246,14 +264,19 @@ export class DroidAcpAgent implements Agent {
     cwd: string;
     droid: DroidAdapter;
     initResult: InitSessionResult;
+    title?: string | null;
   }): { session: Session; initialMode: AcpModeId } {
     const { sessionId, cwd, droid, initResult } = params;
 
     const initialMode = this.getInitialMode(initResult);
+    const now = new Date().toISOString();
     const session: Session = {
       id: sessionId,
       droid,
       droidSessionId: initResult.sessionId,
+      title: typeof params.title === "string" ? params.title : "New Session",
+      updatedAt: now,
+      pendingHistoryContext: null,
       model: initResult.settings?.modelId || "unknown",
       mode: initialMode,
       cancelled: false,
@@ -270,11 +293,17 @@ export class DroidAcpAgent implements Agent {
     };
 
     // Set up notification handler
-    droid.onNotification((n) => this.handleNotification(session, n));
+    droid.onNotification((n) => {
+      const current = this.sessions.get(sessionId);
+      if (!current || current.droid !== droid) return;
+      void this.handleNotification(current, n);
+    });
 
     // Forward raw events for debugging (enable with DROID_DEBUG=1)
     if (process.env.DROID_DEBUG) {
       droid.onRawEvent(async (event) => {
+        const current = this.sessions.get(sessionId);
+        if (!current || current.droid !== droid) return;
         await this.client.sessionUpdate({
           sessionId: session.id,
           update: {
@@ -290,24 +319,45 @@ export class DroidAcpAgent implements Agent {
 
     // Handle permission requests
     droid.onRequest(async (method, params) => {
+      const current = this.sessions.get(sessionId);
+      if (!current || current.droid !== droid) {
+        return { selectedOption: "proceed_once" };
+      }
       if (method === "droid.request_permission") {
-        return this.handlePermission(session, params as PermissionRequest);
+        return this.handlePermission(current, params as PermissionRequest);
       }
       throw new Error("Method not supported");
     });
 
     // Handle droid process exit
     droid.onExit((code) => {
-      this.logger.log("Droid exited, cleaning up session:", session.id, "code:", code);
-      if (session.promptResolve) {
-        session.promptResolve({ stopReason: "end_turn" });
-        session.promptResolve = null;
+      const current = this.sessions.get(sessionId);
+      if (!current || current.droid !== droid) {
+        this.logger.log("Droid exited (stale), ignoring:", sessionId, "code:", code);
+        return;
       }
-      this.sessions.delete(session.id);
+      this.logger.log("Droid exited, cleaning up session:", sessionId, "code:", code);
+      if (current.promptResolve) {
+        current.promptResolve({ stopReason: "end_turn" });
+        current.promptResolve = null;
+      }
+      this.sessions.delete(sessionId);
     });
 
     this.sessions.set(sessionId, session);
     this.logger.log("Session created:", sessionId);
+
+    // Ensure clients can track sessions and populate "History" UIs.
+    setTimeout(() => {
+      void this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          title: session.title,
+          updatedAt: session.updatedAt,
+        },
+      });
+    }, 0);
 
     // Optional diagnostics for Zed env + websearch proxy wiring.
     // Enable with DROID_ACP_WEBSEARCH_DEBUG=1 (or DROID_DEBUG=1).
@@ -378,6 +428,12 @@ export class DroidAcpAgent implements Agent {
   }
 
   async loadSession(request: LoadSessionRequest): Promise<LoadSessionResponse> {
+    if (!isExperimentSessionsEnabled()) {
+      throw new Error(
+        "Session load is experimental. Start droid-acp with --experiment-sessions (or set DROID_ACP_EXPERIMENT_SESSIONS=1).",
+      );
+    }
+
     const requestCwd = request.cwd || process.cwd();
     this.logger.log("loadSession:", request.sessionId, requestCwd);
 
@@ -429,6 +485,7 @@ export class DroidAcpAgent implements Agent {
       cwd,
       droid,
       initResult,
+      title: header?.title ?? null,
     });
 
     if (jsonlPath) {
@@ -446,10 +503,24 @@ export class DroidAcpAgent implements Agent {
   }
 
   async unstable_listSessions(request: ListSessionsRequest): Promise<ListSessionsResponse> {
+    if (!isExperimentSessionsEnabled()) {
+      throw new Error(
+        "Session list is experimental. Start droid-acp with --experiment-sessions (or set DROID_ACP_EXPERIMENT_SESSIONS=1).",
+      );
+    }
+
+    this.logger.log(
+      "listSessions:",
+      request.cwd ?? "<unset>",
+      "cursor:",
+      request.cursor ?? "<unset>",
+    );
     const { sessions, nextCursor } = await listFactorySessions({
       cwd: request.cwd ?? null,
       cursor: request.cursor ?? null,
+      preferredCwd: request.cwd ?? process.cwd(),
     });
+    this.logger.log("listSessions result:", sessions.length, "nextCursor:", nextCursor ?? "<none>");
 
     return {
       sessions: sessions.map((s) => ({
@@ -463,6 +534,12 @@ export class DroidAcpAgent implements Agent {
   }
 
   async unstable_resumeSession(request: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    if (!isExperimentSessionsEnabled()) {
+      throw new Error(
+        "Session resume is experimental. Start droid-acp with --experiment-sessions (or set DROID_ACP_EXPERIMENT_SESSIONS=1).",
+      );
+    }
+
     const cwd = request.cwd || process.cwd();
     this.logger.log("resumeSession:", request.sessionId, cwd);
 
@@ -539,7 +616,10 @@ export class DroidAcpAgent implements Agent {
     }
   }
 
-  private async replayHistoryFromInitMessages(session: Session, messages: unknown[]): Promise<void> {
+  private async replayHistoryFromInitMessages(
+    session: Session,
+    messages: unknown[],
+  ): Promise<void> {
     this.logger.log("Replaying session history from init result (messages):", messages.length);
 
     for (const entry of messages) {
@@ -576,7 +656,9 @@ export class DroidAcpAgent implements Agent {
               type: "tool_result",
               toolUseId,
               content:
-                typeof contentValue === "string" ? contentValue : JSON.stringify(contentValue ?? "", null, 2),
+                typeof contentValue === "string"
+                  ? contentValue
+                  : JSON.stringify(contentValue ?? "", null, 2),
               isError: typeof isError === "boolean" ? isError : false,
             });
           }
@@ -633,10 +715,13 @@ export class DroidAcpAgent implements Agent {
         });
       }
 
-      const toolUses = message.content.filter((c) => (c as Record<string, unknown>)?.type === "tool_use");
+      const toolUses = message.content.filter(
+        (c) => (c as Record<string, unknown>)?.type === "tool_use",
+      );
       for (const toolUseContent of toolUses) {
         const u = toolUseContent as Record<string, unknown>;
-        const toolId = u.id ?? u.toolUseId ?? u.tool_use_id ?? u.tool_call_id ?? u.callId ?? u.call_id;
+        const toolId =
+          u.id ?? u.toolUseId ?? u.tool_use_id ?? u.tool_call_id ?? u.callId ?? u.call_id;
         const toolName = u.name ?? u.toolName ?? u.tool_name;
         if (typeof toolId !== "string") continue;
         await this.handleNotification(session, {
@@ -651,6 +736,42 @@ export class DroidAcpAgent implements Agent {
         });
       }
     }
+  }
+
+  private async buildHistoryTranscriptFromJsonl(
+    jsonlPath: string,
+    maxChars: number,
+  ): Promise<string> {
+    const lines: string[] = [];
+
+    for await (const entry of streamFactorySessionJsonl(jsonlPath)) {
+      const record = entry as { type?: unknown; message?: unknown };
+      if (record.type !== "message") continue;
+
+      const message = record.message as { role?: unknown; content?: unknown };
+      const role = message?.role;
+      const content = message?.content;
+      if (role !== "user" && role !== "assistant") continue;
+      if (!Array.isArray(content)) continue;
+
+      const textParts = content
+        .filter((c) => {
+          const obj = c as Record<string, unknown>;
+          return obj.type === "text" && typeof obj.text === "string";
+        })
+        .map((c) => (c as { text: string }).text.trim())
+        .filter((t) => t.length > 0)
+        .filter((t) => !t.includes("<system-reminder>"));
+
+      if (textParts.length === 0) continue;
+
+      const label = role === "user" ? "User" : "Assistant";
+      lines.push(`${label}: ${textParts.join("")}`);
+    }
+
+    const transcript = lines.join("\n\n").trim();
+    if (transcript.length <= maxChars) return transcript;
+    return transcript.slice(transcript.length - maxChars);
   }
 
   async prompt(request: PromptRequest): Promise<PromptResponse> {
@@ -724,12 +845,41 @@ export class DroidAcpAgent implements Agent {
       text = "Please see the attached image(s).";
     }
 
+    const derivedTitle = (() => {
+      const firstLine = text
+        .split("\n")
+        .map((l) => l.trim())
+        .find((l) => l.length > 0);
+      if (!firstLine) return null;
+      return firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine;
+    })();
+
+    const now = new Date().toISOString();
+    session.updatedAt = now;
+    if ((!session.title || session.title === "New Session") && derivedTitle) {
+      session.title = derivedTitle;
+    }
+    void this.client.sessionUpdate({
+      sessionId: session.id,
+      update: {
+        sessionUpdate: "session_info_update",
+        title: session.title,
+        updatedAt: session.updatedAt,
+      },
+    });
+
     // Handle slash commands
     if (text.startsWith("/")) {
       const handled = await this.handleSlashCommand(session, text);
       if (handled) {
         return { stopReason: "end_turn" };
       }
+    }
+
+    if (session.pendingHistoryContext) {
+      const historyContext = session.pendingHistoryContext;
+      session.pendingHistoryContext = null;
+      text = `<context ref="session_history">\n${historyContext}\n</context>\n\n${text}`.trim();
     }
 
     // Send message and wait for completion
@@ -897,6 +1047,151 @@ export class DroidAcpAgent implements Agent {
           `- Droid Running: ${session.droid.isRunning()}`,
         ].join("\n");
         await this.sendAgentMessage(session, status);
+        return true;
+      }
+
+      case "sessions": {
+        if (!isExperimentSessionsEnabled()) {
+          await this.sendAgentMessage(
+            session,
+            "Experimental feature disabled.\n\nEnable with `npx droid-acp --experiment-sessions` (or set `DROID_ACP_EXPERIMENT_SESSIONS=1`).",
+          );
+          return true;
+        }
+
+        const parts = trimmedArgs.split(/\s+/).filter((p) => p.length > 0);
+        const sub = parts[0]?.toLowerCase();
+
+        if (!sub || sub === "list") {
+          const { sessions } = await listFactorySessions({
+            cwd: session.cwd,
+            cursor: null,
+            pageSize: 20,
+          });
+
+          if (sessions.length === 0) {
+            await this.sendAgentMessage(
+              session,
+              `No sessions found for:\n\n- cwd: \`${session.cwd}\`\n\nTry: \`/sessions all\``,
+            );
+            return true;
+          }
+
+          const lines = sessions.map((s) => {
+            const time = s.updatedAt ? ` — ${s.updatedAt}` : "";
+            const title = s.title ? ` — ${s.title}` : "";
+            return `- \`${s.sessionId}\`${title}${time}`;
+          });
+
+          await this.sendAgentMessage(
+            session,
+            [
+              `**Sessions (${session.cwd})**`,
+              "",
+              ...lines,
+              "",
+              "Use: `/sessions load <session_id>`",
+            ]
+              .join("\n")
+              .trim(),
+          );
+          return true;
+        }
+
+        if (sub === "all") {
+          const { sessions } = await listFactorySessions({
+            cwd: null,
+            cursor: null,
+            pageSize: 20,
+            preferredCwd: session.cwd,
+          });
+
+          if (sessions.length === 0) {
+            await this.sendAgentMessage(session, "No sessions found in local history.");
+            return true;
+          }
+
+          const lines = sessions.map((s) => {
+            const time = s.updatedAt ? ` — ${s.updatedAt}` : "";
+            const title = s.title ? ` — ${s.title}` : "";
+            return `- \`${s.sessionId}\` (${s.cwd})${title}${time}`;
+          });
+
+          await this.sendAgentMessage(
+            session,
+            ["**Recent Sessions**", "", ...lines, "", "Use: `/sessions load <session_id>`"]
+              .join("\n")
+              .trim(),
+          );
+          return true;
+        }
+
+        if (sub === "load" && typeof parts[1] === "string" && parts[1].length > 0) {
+          const targetSessionId = parts[1];
+          await this.sendAgentMessage(session, `Loading session: \`${targetSessionId}\`…`);
+
+          const jsonlPath = await resolveFactorySessionJsonlPath({
+            sessionId: targetSessionId,
+            cwd: session.cwd,
+          });
+          if (!jsonlPath) {
+            await this.sendAgentMessage(
+              session,
+              `Session history not found on disk for: \`${targetSessionId}\``,
+            );
+            return true;
+          }
+
+          const header = await readFactorySessionStart(jsonlPath);
+          const cwd = header?.cwd ?? session.cwd;
+
+          try {
+            await session.droid.stop();
+          } catch {}
+
+          let droid = createDroidAdapter({
+            cwd,
+            logger: this.logger,
+            resumeSessionId: targetSessionId,
+          });
+          let initResult = await droid.start();
+          const resumed = initResult.sessionId === targetSessionId;
+          if (!resumed) {
+            try {
+              await droid.stop();
+            } catch {}
+            droid = createDroidAdapter({ cwd, logger: this.logger });
+            initResult = await droid.start();
+          }
+
+          const { session: newSession } = this.attachSession({
+            sessionId: session.id,
+            cwd,
+            droid,
+            initResult,
+            title: header?.title ?? null,
+          });
+
+          await this.replayHistoryFromJsonl(newSession, jsonlPath);
+          if (resumed) {
+            await this.sendAgentMessage(newSession, `Loaded session: \`${targetSessionId}\``);
+          } else {
+            const transcript = await this.buildHistoryTranscriptFromJsonl(jsonlPath, 12000);
+            if (transcript.length > 0) {
+              newSession.pendingHistoryContext = transcript;
+            }
+            await this.sendAgentMessage(
+              newSession,
+              `Loaded history from disk for \`${targetSessionId}\`, but Droid could not resume this session id.\n\nYour next message will include a transcript as context (so Droid can continue without a Factory login).`,
+            );
+          }
+          return true;
+        }
+
+        await this.sendAgentMessage(
+          session,
+          "Usage:\n\n- `/sessions` (list current cwd)\n- `/sessions all` (list global)\n- `/sessions load <session_id>`",
+        );
         return true;
       }
 

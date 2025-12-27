@@ -145,6 +145,11 @@ function runNativeAcp(): void {
 
 // Parse command line arguments
 const useNativeAcp = process.argv.includes("--acp");
+const enableExperimentSessions = process.argv.includes("--experiment-sessions");
+
+if (enableExperimentSessions) {
+  process.env.DROID_ACP_EXPERIMENT_SESSIONS = "1";
+}
 
 if (useNativeAcp) {
   // Native ACP mode: direct pipe to droid (no custom model support)
