@@ -213,9 +213,13 @@ droid-acp supports ACP `session/list`, `session/load` and `session/resume`, plus
 
 ### `/sessions` usage
 
-- `/sessions` (or `/sessions list`) - list sessions for the current `cwd`
+- `/sessions` (or `/sessions list`) - list sessions for the current `cwd` (numbered)
 - `/sessions all` - list recent sessions across all `cwd`s (prefers the current `cwd`)
-- `/sessions load <session_id>` - switch to that session/history
+- `/sessions <#>` - load by index from the last list
+- `/sessions load <#>` - load by index from the last list
+- `/sessions load <session_id_prefix>` - load by id prefix (from the last list)
+- `/sessions load <session_id>` - load by full session id
+- `/sessions load last` - load the most recent session (from the last list)
 
 When loading:
 
