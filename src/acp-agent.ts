@@ -255,7 +255,8 @@ export class DroidAcpAgent implements Agent {
     if (shouldEmitWebsearchStatus) {
       const websearchProxyBaseUrl = droid.getWebsearchProxyBaseUrl();
       const parentFactoryApiKey = process.env.FACTORY_API_KEY;
-      const willInjectDummyFactoryApiKey = isEnvEnabled(process.env.DROID_ACP_WEBSEARCH) && !parentFactoryApiKey;
+      const willInjectDummyFactoryApiKey =
+        isEnvEnabled(process.env.DROID_ACP_WEBSEARCH) && !parentFactoryApiKey;
       setTimeout(() => {
         void this.client.sessionUpdate({
           sessionId,

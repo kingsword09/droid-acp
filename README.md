@@ -12,6 +12,7 @@ Use Droid from any [ACP-compatible](https://agentclientprotocol.com) clients suc
 - Image prompts (e.g. paste screenshots in Zed)
 - Multiple model support
 - Session modes (Spec, Manual, Auto Low/Medium/High)
+- Optional WebSearch proxy (Smithery Exa MCP / custom forward)
 
 ## Installation
 
@@ -24,10 +25,12 @@ npm install droid-acp
 ### Prerequisites
 
 1. Install Droid CLI from [Factory](https://factory.ai)
-2. Set your Factory API key:
+2. (Recommended) Set your Factory API key for Factory-hosted features:
    ```bash
    export FACTORY_API_KEY=fk-...
    ```
+
+> If you only need WebSearch via the built-in proxy + Smithery Exa MCP, a valid Factory key is not required (droid-acp injects a dummy key into the spawned droid process to satisfy droid's local auth gate).
 
 ### Running
 
@@ -93,6 +96,25 @@ Add to your Zed `settings.json`:
 }
 ```
 
+**Enable WebSearch proxy (Smithery Exa MCP):**
+
+```json
+{
+  "agent_servers": {
+    "Droid WebSearch": {
+      "type": "custom",
+      "command": "npx",
+      "args": ["droid-acp"],
+      "env": {
+        "DROID_ACP_WEBSEARCH": "1",
+        "SMITHERY_API_KEY": "your_smithery_key",
+        "SMITHERY_PROFILE": "your_profile_id"
+      }
+    }
+  }
+}
+```
+
 ### Modes
 
 | Command               | Mode           | Custom Models    | Description                   |
@@ -104,21 +126,37 @@ Add to your Zed `settings.json`:
 
 ### Environment Variables
 
-- `FACTORY_API_KEY` - Your Factory API key (required)
+- `FACTORY_API_KEY` - Your Factory API key (recommended for Factory-hosted features)
 - `DROID_EXECUTABLE` - Path to the droid binary (optional, defaults to `droid` in PATH)
+
 - `DROID_ACP_WEBSEARCH` - Enable local proxy to optionally intercept Droid websearch (`/api/tools/exa/search`)
 - `DROID_ACP_WEBSEARCH_FORWARD_URL` - Optional forward target for websearch (base URL or full URL)
 - `DROID_ACP_WEBSEARCH_FORWARD_MODE` - Forward mode for `DROID_ACP_WEBSEARCH_FORWARD_URL` (`http` or `mcp`, default: `http`)
 - `DROID_ACP_WEBSEARCH_UPSTREAM_URL` - Optional upstream Factory API base URL (default: `FACTORY_API_BASE_URL_OVERRIDE` or `https://api.factory.ai`)
 - `DROID_ACP_WEBSEARCH_HOST` - Optional proxy bind host (default: `127.0.0.1`)
-- `DROID_ACP_WEBSEARCH_PORT` - Optional proxy bind port (default: random available port)
+- `DROID_ACP_WEBSEARCH_PORT` - Optional proxy bind port (default: auto-assign an available port)
+- `DROID_ACP_WEBSEARCH_DEBUG` - Emit a WebSearch status message in the ACP UI (e.g. Zed) for debugging
 
 - `SMITHERY_API_KEY` - Optional (recommended) Smithery Exa MCP API key (enables high-quality websearch)
 - `SMITHERY_PROFILE` - Optional Smithery Exa MCP profile id
 
 ### WebSearch Proxy (optional)
 
-If you want to route Droid's websearch requests (`POST /api/tools/exa/search`) to your own handler:
+Enable the built-in proxy to intercept `POST /api/tools/exa/search` and serve results from Smithery Exa MCP (recommended):
+
+```bash
+export SMITHERY_API_KEY="your_smithery_key"
+export SMITHERY_PROFILE="your_profile_id"
+DROID_ACP_WEBSEARCH=1 npx droid-acp
+```
+
+To debug proxy wiring (shows `proxyBaseUrl` and a `/health` link in the ACP UI):
+
+```bash
+DROID_ACP_WEBSEARCH=1 DROID_ACP_WEBSEARCH_DEBUG=1 npx droid-acp
+```
+
+To forward WebSearch to your own HTTP handler instead:
 
 ```bash
 DROID_ACP_WEBSEARCH=1 \
@@ -126,13 +164,19 @@ DROID_ACP_WEBSEARCH_FORWARD_URL="http://127.0.0.1:20002" \
 npx droid-acp
 ```
 
-If you want to use Smithery Exa (MCP) like `droid-patch`, set:
+To forward WebSearch to an MCP endpoint (JSON-RPC `tools/call`), set:
 
 ```bash
-export SMITHERY_API_KEY="your_smithery_key"
-export SMITHERY_PROFILE="your_profile_id"
-DROID_ACP_WEBSEARCH=1 npx droid-acp
+DROID_ACP_WEBSEARCH=1 \
+DROID_ACP_WEBSEARCH_FORWARD_MODE=mcp \
+DROID_ACP_WEBSEARCH_FORWARD_URL="http://127.0.0.1:20002" \
+npx droid-acp
 ```
+
+Notes:
+
+- The proxy exposes `GET /health` on `proxyBaseUrl` (handy for troubleshooting).
+- When `DROID_ACP_WEBSEARCH=1`, droid-acp injects a dummy `FACTORY_API_KEY` into the spawned droid process if none is set, so WebSearch requests can reach the proxy even without Factory login.
 
 ## Session Modes
 

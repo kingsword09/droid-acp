@@ -97,7 +97,9 @@ function toNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-function parseWebsearchRequestBody(bodyBuffer: Buffer): { query: string; numResults: number } | null {
+function parseWebsearchRequestBody(
+  bodyBuffer: Buffer,
+): { query: string; numResults: number } | null {
   let input: unknown;
   try {
     input = JSON.parse(bodyBuffer.toString("utf8"));
@@ -133,7 +135,10 @@ async function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer>
   return Buffer.concat(chunks);
 }
 
-function parseSearchResultsText(text: string, numResults: number): Array<Record<string, unknown>> | null {
+function parseSearchResultsText(
+  text: string,
+  numResults: number,
+): Array<Record<string, unknown>> | null {
   // First try JSON (some MCP servers return an array encoded in text).
   try {
     const json = JSON.parse(text) as unknown;
@@ -215,8 +220,8 @@ async function tryHandleWebsearchWithMcp(
     return { handled: false, error: message };
   }
 
-  const resultContent = (mcpResponse as { result?: { content?: unknown } } | null | undefined)?.result
-    ?.content;
+  const resultContent = (mcpResponse as { result?: { content?: unknown } } | null | undefined)
+    ?.result?.content;
   const contentBlocks = Array.isArray(resultContent) ? (resultContent as Array<unknown>) : [];
   const textBlock = contentBlocks.find(
     (c): c is { type: string; text: string } =>
@@ -232,7 +237,9 @@ async function tryHandleWebsearchWithMcp(
       (mcpResponse as { error?: unknown } | null | undefined)?.error ??
       null;
     const message =
-      typeof errorMessage === "string" ? errorMessage : `Invalid MCP response: ${JSON.stringify(mcpResponse)}`;
+      typeof errorMessage === "string"
+        ? errorMessage
+        : `Invalid MCP response: ${JSON.stringify(mcpResponse)}`;
     logger.error("[websearch] MCP response missing text content:", message);
     return { handled: false, error: message };
   }
@@ -250,7 +257,9 @@ async function tryHandleWebsearchWithMcp(
       ? (item.highlights as unknown[]).filter((v): v is string => typeof v === "string")
       : [];
     const content =
-      toNonEmptyString(item.text) ?? toNonEmptyString(item.snippet) ?? (highlights.length > 0 ? highlights.join(" ") : "");
+      toNonEmptyString(item.text) ??
+      toNonEmptyString(item.snippet) ??
+      (highlights.length > 0 ? highlights.join(" ") : "");
 
     return {
       title,
@@ -268,7 +277,9 @@ async function tryHandleWebsearchWithMcp(
   return { handled: true };
 }
 
-export async function startWebsearchProxy(options: WebsearchProxyOptions): Promise<WebsearchProxyHandle> {
+export async function startWebsearchProxy(
+  options: WebsearchProxyOptions,
+): Promise<WebsearchProxyHandle> {
   const logger = options.logger ?? console;
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 0;
@@ -370,7 +381,12 @@ export async function startWebsearchProxy(options: WebsearchProxyOptions): Promi
             return;
           }
           res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "WebSearch MCP forward failed", message: r.error ?? "Unknown error" }));
+          res.end(
+            JSON.stringify({
+              error: "WebSearch MCP forward failed",
+              message: r.error ?? "Unknown error",
+            }),
+          );
           lastWebsearchOutcome = `error: mcp forward (${r.error ?? "unknown"})`;
           return;
         }
@@ -404,8 +420,7 @@ export async function startWebsearchProxy(options: WebsearchProxyOptions): Promi
         upstreamResponse = await fetch(targetUrl, {
           method: req.method,
           headers,
-          body:
-            isBodylessMethod(req.method) ? undefined : bodyBuffer ? bodyBuffer : req,
+          body: isBodylessMethod(req.method) ? undefined : bodyBuffer ? bodyBuffer : req,
           redirect: "manual",
           signal: controller.signal,
           // Required by undici when streaming request bodies.
@@ -418,9 +433,11 @@ export async function startWebsearchProxy(options: WebsearchProxyOptions): Promi
         return;
       }
 
-      const setCookie: string[] | undefined = (upstreamResponse.headers as unknown as {
-        getSetCookie?: () => string[];
-      }).getSetCookie?.();
+      const setCookie: string[] | undefined = (
+        upstreamResponse.headers as unknown as {
+          getSetCookie?: () => string[];
+        }
+      ).getSetCookie?.();
       if (setCookie && setCookie.length > 0) {
         res.setHeader("set-cookie", setCookie);
       }
