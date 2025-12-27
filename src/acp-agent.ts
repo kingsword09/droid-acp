@@ -53,6 +53,34 @@ function isExperimentSessionsEnabled(): boolean {
   return isEnvEnabled(process.env.DROID_ACP_EXPERIMENT_SESSIONS);
 }
 
+function sanitizeHistoryTextForDisplay(text: string): string {
+  let out = text;
+  out = out.replace(/<system-reminder>[\s\S]*?(<\/system-reminder>|$)/gi, "");
+  out = out.replace(/<context[^>]*>[\s\S]*?(<\/context>|$)/gi, "");
+  out = out.replace(/<\/?context[^>]*>/gi, "");
+  out = out.replace(/<\/?system-reminder>/gi, "");
+  out = out.replace(/\r\n/g, "\n");
+  out = out.replace(/\n{3,}/g, "\n\n");
+  return out.trim();
+}
+
+function sanitizeSessionTitle(title: string): string {
+  let out = title;
+  out = out.replace(/<system-reminder>[\s\S]*?(<\/system-reminder>|$)/gi, "");
+  out = out.replace(/<\/?context[^>]*>/gi, "");
+  out = out.replace(/<\/?system-reminder>/gi, "");
+  out = out.replace(/^\s*(User|Assistant)\s*:\s*/i, "");
+  out = out.replace(/\s+/g, " ").trim();
+  return out;
+}
+
+function formatTimestampForDisplay(isoTimestamp: string): string {
+  const d = new Date(isoTimestamp);
+  if (Number.isNaN(d.getTime())) return isoTimestamp;
+  const pad2 = (v: number) => String(v).padStart(2, "0");
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+
 function normalizeBase64DataUrl(
   data: string,
   fallbackMimeType: string,
@@ -377,7 +405,7 @@ export class DroidAcpAgent implements Agent {
               type: "text",
               text:
                 [
-                  "[droid-acp] WebSearch 状态",
+                  "[droid-acp] WebSearch status",
                   `- DROID_ACP_WEBSEARCH: ${process.env.DROID_ACP_WEBSEARCH ?? "<unset>"}`,
                   `- DROID_ACP_WEBSEARCH_PORT: ${process.env.DROID_ACP_WEBSEARCH_PORT ?? "<unset>"}`,
                   `- DROID_ACP_WEBSEARCH_FORWARD_MODE: ${process.env.DROID_ACP_WEBSEARCH_FORWARD_MODE ?? "<unset>"}`,
@@ -485,7 +513,7 @@ export class DroidAcpAgent implements Agent {
       cwd,
       droid,
       initResult,
-      title: header?.title ?? null,
+      title: header?.title ? sanitizeSessionTitle(header.title) : null,
     });
 
     if (jsonlPath) {
@@ -526,7 +554,7 @@ export class DroidAcpAgent implements Agent {
       sessions: sessions.map((s) => ({
         sessionId: s.sessionId,
         cwd: s.cwd,
-        title: s.title,
+        title: s.title ? sanitizeSessionTitle(s.title) : null,
         updatedAt: s.updatedAt,
       })),
       nextCursor,
@@ -647,32 +675,17 @@ export class DroidAcpAgent implements Agent {
       for (const block of message.content) {
         const b = block as Record<string, unknown>;
         const blockType = b.type as string | undefined;
-        if (blockType === "tool_result") {
-          const toolUseId = b.tool_use_id ?? b.toolUseId ?? b.toolUseID ?? b.tool_call_id ?? b.id;
-          const contentValue = b.content ?? b.value;
-          const isError = b.is_error ?? b.isError;
-          if (typeof toolUseId === "string") {
-            await this.handleNotification(session, {
-              type: "tool_result",
-              toolUseId,
-              content:
-                typeof contentValue === "string"
-                  ? contentValue
-                  : JSON.stringify(contentValue ?? "", null, 2),
-              isError: typeof isError === "boolean" ? isError : false,
-            });
-          }
-          continue;
-        }
+        if (blockType === "tool_result") continue;
 
         if (blockType === "text") {
           const text = typeof b.text === "string" ? b.text : "";
-          if (text.length > 0) {
+          const cleaned = sanitizeHistoryTextForDisplay(text);
+          if (cleaned.length > 0) {
             await this.client.sessionUpdate({
               sessionId: session.id,
               update: {
                 sessionUpdate: "user_message_chunk",
-                content: { type: "text", text },
+                content: { type: "text", text: cleaned },
               },
             });
           }
@@ -704,7 +717,9 @@ export class DroidAcpAgent implements Agent {
       const textParts = message.content
         .filter((c) => (c as Record<string, unknown>)?.type === "text")
         .map((c) => ((c as Record<string, unknown>)?.text as string) ?? "")
-        .filter((t) => typeof t === "string" && t.length > 0);
+        .filter((t) => typeof t === "string" && t.length > 0)
+        .map((t) => sanitizeHistoryTextForDisplay(t))
+        .filter((t) => t.length > 0);
 
       if (textParts.length > 0) {
         await this.handleNotification(session, {
@@ -712,27 +727,6 @@ export class DroidAcpAgent implements Agent {
           role: "assistant",
           id: message.id,
           text: textParts.join(""),
-        });
-      }
-
-      const toolUses = message.content.filter(
-        (c) => (c as Record<string, unknown>)?.type === "tool_use",
-      );
-      for (const toolUseContent of toolUses) {
-        const u = toolUseContent as Record<string, unknown>;
-        const toolId =
-          u.id ?? u.toolUseId ?? u.tool_use_id ?? u.tool_call_id ?? u.callId ?? u.call_id;
-        const toolName = u.name ?? u.toolName ?? u.tool_name;
-        if (typeof toolId !== "string") continue;
-        await this.handleNotification(session, {
-          type: "message",
-          role: "assistant",
-          id: message.id,
-          toolUse: {
-            id: toolId,
-            name: typeof toolName === "string" ? toolName : "unknown",
-            input: u.input,
-          },
         });
       }
     }
@@ -743,6 +737,7 @@ export class DroidAcpAgent implements Agent {
     maxChars: number,
   ): Promise<string> {
     const lines: string[] = [];
+    let includedSessionHistory = false;
 
     for await (const entry of streamFactorySessionJsonl(jsonlPath)) {
       const record = entry as { type?: unknown; message?: unknown };
@@ -754,19 +749,39 @@ export class DroidAcpAgent implements Agent {
       if (role !== "user" && role !== "assistant") continue;
       if (!Array.isArray(content)) continue;
 
-      const textParts = content
-        .filter((c) => {
-          const obj = c as Record<string, unknown>;
-          return obj.type === "text" && typeof obj.text === "string";
-        })
-        .map((c) => (c as { text: string }).text.trim())
-        .filter((t) => t.length > 0)
-        .filter((t) => !t.includes("<system-reminder>"));
+      const rawText = content
+        .filter((c) => (c as Record<string, unknown>)?.type === "text")
+        .map((c) => ((c as Record<string, unknown>)?.text as string) ?? "")
+        .join("");
 
-      if (textParts.length === 0) continue;
+      if (role === "user") {
+        const sessionHistoryMatch = rawText.match(
+          /<context[^>]*\sref=["']session_history["'][^>]*>([\s\S]*?)<\/context>/i,
+        );
+        const embeddedHistory = sessionHistoryMatch?.[1] ? sessionHistoryMatch[1].trim() : "";
+        if (!includedSessionHistory && embeddedHistory.length > 0) {
+          const cleanedHistory = sanitizeHistoryTextForDisplay(embeddedHistory);
+          if (cleanedHistory.length > 0) {
+            includedSessionHistory = true;
+            lines.push(`[Previous session transcript]\n${cleanedHistory}`);
+          }
+        }
 
-      const label = role === "user" ? "User" : "Assistant";
-      lines.push(`${label}: ${textParts.join("")}`);
+        const withoutSessionHistory = rawText.replace(
+          /<context[^>]*\sref=["']session_history["'][^>]*>[\s\S]*?<\/context>/gi,
+          "",
+        );
+        const cleanedUserText = sanitizeHistoryTextForDisplay(withoutSessionHistory);
+        if (cleanedUserText.length > 0) {
+          lines.push(`User: ${cleanedUserText}`);
+        }
+        continue;
+      }
+
+      const cleanedAssistantText = sanitizeHistoryTextForDisplay(rawText);
+      if (cleanedAssistantText.length > 0) {
+        lines.push(`Assistant: ${cleanedAssistantText}`);
+      }
     }
 
     const transcript = lines.join("\n\n").trim();
@@ -851,7 +866,9 @@ export class DroidAcpAgent implements Agent {
         .map((l) => l.trim())
         .find((l) => l.length > 0);
       if (!firstLine) return null;
-      return firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine;
+      const cleaned = sanitizeSessionTitle(firstLine);
+      if (cleaned.length === 0) return null;
+      return cleaned.length > 80 ? `${cleaned.slice(0, 77)}...` : cleaned;
     })();
 
     const now = new Date().toISOString();
@@ -879,7 +896,7 @@ export class DroidAcpAgent implements Agent {
     if (session.pendingHistoryContext) {
       const historyContext = session.pendingHistoryContext;
       session.pendingHistoryContext = null;
-      text = `<context ref="session_history">\n${historyContext}\n</context>\n\n${text}`.trim();
+      text = `${text}\n\n<context ref="session_history">\n${historyContext}\n</context>`.trim();
     }
 
     // Send message and wait for completion
@@ -963,7 +980,7 @@ export class DroidAcpAgent implements Agent {
           "**Available Commands:**\n",
           ...commands.map((cmd) => {
             const inputHint = cmd.input && "hint" in cmd.input ? ` ${cmd.input.hint}` : "";
-            return `- \`/${cmd.name}${inputHint}\` - ${cmd.description}`;
+            return `- /${cmd.name}${inputHint} - ${cmd.description}`;
           }),
         ].join("\n");
         await this.sendAgentMessage(session, helpText);
@@ -1072,26 +1089,21 @@ export class DroidAcpAgent implements Agent {
           if (sessions.length === 0) {
             await this.sendAgentMessage(
               session,
-              `No sessions found for:\n\n- cwd: \`${session.cwd}\`\n\nTry: \`/sessions all\``,
+              `No sessions found for:\n\n- cwd: ${session.cwd}\n\nTry: /sessions all`,
             );
             return true;
           }
 
           const lines = sessions.map((s) => {
-            const time = s.updatedAt ? ` — ${s.updatedAt}` : "";
-            const title = s.title ? ` — ${s.title}` : "";
-            return `- \`${s.sessionId}\`${title}${time}`;
+            const time = s.updatedAt ? ` — ${formatTimestampForDisplay(s.updatedAt)}` : "";
+            const cleanedTitle = s.title ? sanitizeSessionTitle(s.title) : "";
+            const title = cleanedTitle.length > 0 ? ` — ${cleanedTitle}` : "";
+            return `- ${s.sessionId}${title}${time}`;
           });
 
           await this.sendAgentMessage(
             session,
-            [
-              `**Sessions (${session.cwd})**`,
-              "",
-              ...lines,
-              "",
-              "Use: `/sessions load <session_id>`",
-            ]
+            [`**Sessions (${session.cwd})**`, "", ...lines, "", "Use: /sessions load <session_id>"]
               .join("\n")
               .trim(),
           );
@@ -1112,14 +1124,15 @@ export class DroidAcpAgent implements Agent {
           }
 
           const lines = sessions.map((s) => {
-            const time = s.updatedAt ? ` — ${s.updatedAt}` : "";
-            const title = s.title ? ` — ${s.title}` : "";
-            return `- \`${s.sessionId}\` (${s.cwd})${title}${time}`;
+            const time = s.updatedAt ? ` — ${formatTimestampForDisplay(s.updatedAt)}` : "";
+            const cleanedTitle = s.title ? sanitizeSessionTitle(s.title) : "";
+            const title = cleanedTitle.length > 0 ? ` — ${cleanedTitle}` : "";
+            return `- ${s.sessionId} (${s.cwd})${title}${time}`;
           });
 
           await this.sendAgentMessage(
             session,
-            ["**Recent Sessions**", "", ...lines, "", "Use: `/sessions load <session_id>`"]
+            ["**Recent Sessions**", "", ...lines, "", "Use: /sessions load <session_id>"]
               .join("\n")
               .trim(),
           );
@@ -1128,7 +1141,7 @@ export class DroidAcpAgent implements Agent {
 
         if (sub === "load" && typeof parts[1] === "string" && parts[1].length > 0) {
           const targetSessionId = parts[1];
-          await this.sendAgentMessage(session, `Loading session: \`${targetSessionId}\`…`);
+          await this.sendAgentMessage(session, `Loading session: ${targetSessionId}…`);
 
           const jsonlPath = await resolveFactorySessionJsonlPath({
             sessionId: targetSessionId,
@@ -1137,7 +1150,7 @@ export class DroidAcpAgent implements Agent {
           if (!jsonlPath) {
             await this.sendAgentMessage(
               session,
-              `Session history not found on disk for: \`${targetSessionId}\``,
+              `Session history not found on disk for: ${targetSessionId}`,
             );
             return true;
           }
@@ -1169,28 +1182,27 @@ export class DroidAcpAgent implements Agent {
             cwd,
             droid,
             initResult,
-            title: header?.title ?? null,
+            title: header?.title ? sanitizeSessionTitle(header.title) : null,
           });
 
-          await this.replayHistoryFromJsonl(newSession, jsonlPath);
-          if (resumed) {
-            await this.sendAgentMessage(newSession, `Loaded session: \`${targetSessionId}\``);
-          } else {
+          if (!resumed) {
             const transcript = await this.buildHistoryTranscriptFromJsonl(jsonlPath, 12000);
             if (transcript.length > 0) {
               newSession.pendingHistoryContext = transcript;
             }
             await this.sendAgentMessage(
               newSession,
-              `Loaded history from disk for \`${targetSessionId}\`, but Droid could not resume this session id.\n\nYour next message will include a transcript as context (so Droid can continue without a Factory login).`,
+              `\n\nNote: history is loaded from disk for ${targetSessionId}, but Droid could not resume this session id.\n\nYour next message will automatically include a transcript as context (so Droid can continue without a Factory login).`,
             );
           }
+
+          await this.replayHistoryFromJsonl(newSession, jsonlPath);
           return true;
         }
 
         await this.sendAgentMessage(
           session,
-          "Usage:\n\n- `/sessions` (list current cwd)\n- `/sessions all` (list global)\n- `/sessions load <session_id>`",
+          "Usage:\n\n- /sessions (list current cwd)\n- /sessions all (list global)\n- /sessions load <session_id>",
         );
         return true;
       }
@@ -1199,7 +1211,7 @@ export class DroidAcpAgent implements Agent {
         // Unknown command - show error
         await this.sendAgentMessage(
           session,
-          `Unknown command: \`/${command}\`. Type \`/help\` to see available commands.`,
+          `Unknown command: /${command}. Type /help to see available commands.`,
         );
         return true;
     }
@@ -1341,7 +1353,7 @@ export class DroidAcpAgent implements Agent {
         .replace(/^[*_`]+/, "")
         .trim();
 
-      const explicit = stripped.match(/^(?:Option|方案)\s*([A-Z])\s*[：:–—.)-]\s*(.+)$/i);
+      const explicit = stripped.match(/^(?:Option)\s*([A-Z])\s*[：:–—.)-]\s*(.+)$/i);
       if (explicit) {
         const id = explicit[1].toUpperCase();
         if (seenExplicit.has(id)) continue;
@@ -1820,7 +1832,7 @@ export class DroidAcpAgent implements Agent {
             );
             setTimeout(() => {
               session.droid.sendMessage(
-                `我选择方案 ${choiceId}。请基于该方案继续完善计划/关键改动点，并在准备好执行时再提示退出 spec。`,
+                `I choose Option ${choiceId}. Please continue refining the plan and key changes based on this option, and when you are ready to execute, prompt to exit spec mode.`,
               );
             }, 0);
             return { selectedOption: "cancel" };

@@ -208,9 +208,24 @@ droid-acp supports ACP `session/list`, `session/load` and `session/resume`, plus
 - `session/load`: replays the full conversation history back to the client
 - `session/resume`: resumes without replay (faster, but the client won’t get old messages from the agent)
 
+### `/sessions` usage
+
+- `/sessions` (or `/sessions list`) - list sessions for the current `cwd`
+- `/sessions all` - list recent sessions across all `cwd`s (prefers the current `cwd`)
+- `/sessions load <session_id>` - switch to that session/history
+
+When loading:
+
+- droid-acp first tries to resume Droid via `--session-id` (fast path).
+- If resume fails, it replays history from disk and automatically appends a transcript to your _next_ message so Droid can continue without a Factory login.
+
 Notes:
 
 - History is replayed from Droid’s local session store under `~/.factory/sessions` (override with `DROID_ACP_FACTORY_DIR`).
+- For a cleaner UI, history replay filters out system reminders, embedded `<context ...>` blocks, and tool calls/tool results.
+- Session titles are sanitized (some Droid sessions store titles like `<context ref="session_history"> ...`).
+- Session IDs are displayed as plain text for easy copy/paste.
+- Times shown in `/sessions` are displayed as `YYYY-MM-DD HH:mm:ss` in your local timezone.
 - Native ACP mode (`--acp`) does not support these helpers.
 
 ## Session Modes
