@@ -12,6 +12,7 @@ Use Droid from any [ACP-compatible](https://agentclientprotocol.com) clients suc
 - Image prompts (e.g. paste screenshots in Zed)
 - Multiple model support
 - Session modes (Spec, Manual, Auto Low/Medium/High)
+- Experimental: sessions/history (session list/load + `/sessions`)
 - Optional WebSearch proxy (Smithery Exa MCP / custom forward)
 
 ## Installation
@@ -37,6 +38,9 @@ npm install droid-acp
 ```bash
 # Default mode (stream-jsonrpc, supports custom models)
 npx droid-acp
+
+# Enable experimental sessions/history helpers
+npx droid-acp --experiment-sessions
 
 # Native ACP mode (lighter, but no custom model support)
 npx droid-acp --acp
@@ -115,6 +119,20 @@ Add to your Zed `settings.json`:
 }
 ```
 
+**Enable experimental sessions/history (`/sessions`, `session/list`, `session/load`):**
+
+```json
+{
+  "agent_servers": {
+    "Droid Sessions (Experimental)": {
+      "type": "custom",
+      "command": "npx",
+      "args": ["droid-acp", "--experiment-sessions"]
+    }
+  }
+}
+```
+
 ### Modes
 
 | Command               | Mode           | Custom Models    | Description                   |
@@ -128,6 +146,8 @@ Add to your Zed `settings.json`:
 
 - `FACTORY_API_KEY` - Your Factory API key (recommended for Factory-hosted features)
 - `DROID_EXECUTABLE` - Path to the droid binary (optional, defaults to `droid` in PATH)
+- `DROID_ACP_FACTORY_DIR` - Override Factory config dir (defaults to `~/.factory`)
+- `DROID_ACP_EXPERIMENT_SESSIONS` - Enable experimental sessions/history features (same as `--experiment-sessions`)
 
 - `DROID_ACP_WEBSEARCH` - Enable local proxy to optionally intercept Droid websearch (`/api/tools/exa/search`)
 - `DROID_ACP_WEBSEARCH_FORWARD_URL` - Optional forward target for websearch (base URL or full URL)
@@ -177,6 +197,21 @@ Notes:
 
 - The proxy exposes `GET /health` on `proxyBaseUrl` (handy for troubleshooting).
 - When `DROID_ACP_WEBSEARCH=1`, droid-acp injects a dummy `FACTORY_API_KEY` into the spawned droid process if none is set, so WebSearch requests can reach the proxy even without Factory login.
+
+## Sessions (History / Resume)
+
+This is an **experimental** feature. Enable with `npx droid-acp --experiment-sessions` (or set `DROID_ACP_EXPERIMENT_SESSIONS=1`).
+
+droid-acp supports ACP `session/list`, `session/load` and `session/resume`, plus an in-thread workaround command:
+
+- `/sessions`: list/load sessions from local Droid history (useful because some clients don’t yet persist external ACP agent history)
+- `session/load`: replays the full conversation history back to the client
+- `session/resume`: resumes without replay (faster, but the client won’t get old messages from the agent)
+
+Notes:
+
+- History is replayed from Droid’s local session store under `~/.factory/sessions` (override with `DROID_ACP_FACTORY_DIR`).
+- Native ACP mode (`--acp`) does not support these helpers.
 
 ## Session Modes
 

@@ -6,8 +6,14 @@ import {
   type AvailableCommand,
   type InitializeRequest,
   type InitializeResponse,
+  type LoadSessionRequest,
+  type LoadSessionResponse,
   type NewSessionRequest,
   type NewSessionResponse,
+  type ListSessionsRequest,
+  type ListSessionsResponse,
+  type ResumeSessionRequest,
+  type ResumeSessionResponse,
   type PromptRequest,
   type PromptResponse,
   type CancelNotification,
@@ -26,8 +32,15 @@ import {
   type DroidAutonomyLevel,
   type DroidNotification,
   type DroidPermissionOption,
+  type InitSessionResult,
   type PermissionRequest,
 } from "./types.ts";
+import {
+  listFactorySessions,
+  readFactorySessionStart,
+  resolveFactorySessionJsonlPath,
+  streamFactorySessionJsonl,
+} from "./factory-sessions.ts";
 import { isEnvEnabled, type Logger, nodeToWebReadable, nodeToWebWritable } from "./utils.ts";
 
 const nodeRequire = createRequire(import.meta.url);
@@ -35,6 +48,10 @@ const packageJson = nodeRequire("../package.json") as {
   name: string;
   version: string;
 };
+
+function isExperimentSessionsEnabled(): boolean {
+  return isEnvEnabled(process.env.DROID_ACP_EXPERIMENT_SESSIONS);
+}
 
 function normalizeBase64DataUrl(
   data: string,
@@ -55,7 +72,7 @@ function normalizeBase64DataUrl(
 // Note: Only commands that can be implemented via Droid's JSON-RPC API are supported.
 // CLI-only commands (clear, compact, sessions, etc.) don't have API equivalents.
 function getAvailableCommands(): AvailableCommand[] {
-  return [
+  const commands: AvailableCommand[] = [
     {
       name: "help",
       description: "Show available slash commands",
@@ -82,12 +99,25 @@ function getAvailableCommands(): AvailableCommand[] {
       input: null,
     },
   ];
+
+  if (isExperimentSessionsEnabled()) {
+    commands.push({
+      name: "sessions",
+      description: "List or load previous sessions (local Droid history)",
+      input: { hint: "[load <session_id>|all]" },
+    });
+  }
+
+  return commands;
 }
 
 interface Session {
   id: string;
   droid: DroidAdapter;
   droidSessionId: string;
+  title: string | null;
+  updatedAt: string | null;
+  pendingHistoryContext: string | null;
   model: string;
   mode: AcpModeId;
   cancelled: boolean;
@@ -146,10 +176,13 @@ export class DroidAcpAgent implements Agent {
 
   async initialize(_request: InitializeRequest): Promise<InitializeResponse> {
     this.logger.log("initialize");
+    const enableSessions = isExperimentSessionsEnabled();
     return {
       protocolVersion: 1,
       agentCapabilities: {
+        loadSession: enableSessions,
         promptCapabilities: { image: true, embeddedContext: true },
+        sessionCapabilities: enableSessions ? { list: {}, resume: {} } : {},
       },
       agentInfo: {
         name: packageJson.name,
@@ -177,22 +210,73 @@ export class DroidAcpAgent implements Agent {
     throw new Error(`Unknown auth method: ${request.methodId}`);
   }
 
-  async newSession(request: NewSessionRequest): Promise<NewSessionResponse> {
-    const cwd = request.cwd || process.cwd();
-    this.logger.log("newSession:", cwd);
+  private getInitialMode(initResult: InitSessionResult): AcpModeId {
+    return typeof initResult.settings?.autonomyLevel === "string"
+      ? (droidAutonomyToAcpModeId(initResult.settings.autonomyLevel) ?? "off")
+      : "off";
+  }
 
-    const droid = createDroidAdapter({ cwd, logger: this.logger });
-    const initResult = await droid.start();
+  private getModelsState(initResult: InitSessionResult): NonNullable<NewSessionResponse["models"]> {
+    return {
+      availableModels: initResult.availableModels.map((m) => ({
+        modelId: m.id,
+        name: m.displayName,
+      })),
+      currentModelId: initResult.settings?.modelId || "unknown",
+    };
+  }
 
-    const sessionId = initResult.sessionId;
-    const initialMode: AcpModeId =
-      typeof initResult.settings?.autonomyLevel === "string"
-        ? (droidAutonomyToAcpModeId(initResult.settings.autonomyLevel) ?? "off")
-        : "off";
+  private getModesState(currentModeId: AcpModeId): NonNullable<NewSessionResponse["modes"]> {
+    return {
+      currentModeId,
+      availableModes: [
+        {
+          id: "spec",
+          name: "Spec",
+          description: "Research and plan only - no code changes",
+        },
+        {
+          id: "off",
+          name: "Auto Off",
+          description: "Read-only mode - safe for reviewing planned changes without execution",
+        },
+        {
+          id: "low",
+          name: "Auto Low",
+          description: "Low-risk operations - file creation/modification, no system changes",
+        },
+        {
+          id: "medium",
+          name: "Auto Medium",
+          description: "Development operations - npm install, git commit, build commands",
+        },
+        {
+          id: "high",
+          name: "Auto High",
+          description: "Production operations - git push, deployments, database migrations",
+        },
+      ],
+    };
+  }
+
+  private attachSession(params: {
+    sessionId: string;
+    cwd: string;
+    droid: DroidAdapter;
+    initResult: InitSessionResult;
+    title?: string | null;
+  }): { session: Session; initialMode: AcpModeId } {
+    const { sessionId, cwd, droid, initResult } = params;
+
+    const initialMode = this.getInitialMode(initResult);
+    const now = new Date().toISOString();
     const session: Session = {
       id: sessionId,
       droid,
       droidSessionId: initResult.sessionId,
+      title: typeof params.title === "string" ? params.title : "New Session",
+      updatedAt: now,
+      pendingHistoryContext: null,
       model: initResult.settings?.modelId || "unknown",
       mode: initialMode,
       cancelled: false,
@@ -209,11 +293,17 @@ export class DroidAcpAgent implements Agent {
     };
 
     // Set up notification handler
-    droid.onNotification((n) => this.handleNotification(session, n));
+    droid.onNotification((n) => {
+      const current = this.sessions.get(sessionId);
+      if (!current || current.droid !== droid) return;
+      void this.handleNotification(current, n);
+    });
 
     // Forward raw events for debugging (enable with DROID_DEBUG=1)
     if (process.env.DROID_DEBUG) {
       droid.onRawEvent(async (event) => {
+        const current = this.sessions.get(sessionId);
+        if (!current || current.droid !== droid) return;
         await this.client.sessionUpdate({
           sessionId: session.id,
           update: {
@@ -229,24 +319,45 @@ export class DroidAcpAgent implements Agent {
 
     // Handle permission requests
     droid.onRequest(async (method, params) => {
+      const current = this.sessions.get(sessionId);
+      if (!current || current.droid !== droid) {
+        return { selectedOption: "proceed_once" };
+      }
       if (method === "droid.request_permission") {
-        return this.handlePermission(session, params as PermissionRequest);
+        return this.handlePermission(current, params as PermissionRequest);
       }
       throw new Error("Method not supported");
     });
 
     // Handle droid process exit
     droid.onExit((code) => {
-      this.logger.log("Droid exited, cleaning up session:", session.id, "code:", code);
-      if (session.promptResolve) {
-        session.promptResolve({ stopReason: "end_turn" });
-        session.promptResolve = null;
+      const current = this.sessions.get(sessionId);
+      if (!current || current.droid !== droid) {
+        this.logger.log("Droid exited (stale), ignoring:", sessionId, "code:", code);
+        return;
       }
-      this.sessions.delete(session.id);
+      this.logger.log("Droid exited, cleaning up session:", sessionId, "code:", code);
+      if (current.promptResolve) {
+        current.promptResolve({ stopReason: "end_turn" });
+        current.promptResolve = null;
+      }
+      this.sessions.delete(sessionId);
     });
 
     this.sessions.set(sessionId, session);
     this.logger.log("Session created:", sessionId);
+
+    // Ensure clients can track sessions and populate "History" UIs.
+    setTimeout(() => {
+      void this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          title: session.title,
+          updatedAt: session.updatedAt,
+        },
+      });
+    }, 0);
 
     // Optional diagnostics for Zed env + websearch proxy wiring.
     // Enable with DROID_ACP_WEBSEARCH_DEBUG=1 (or DROID_DEBUG=1).
@@ -296,46 +407,371 @@ export class DroidAcpAgent implements Agent {
       });
     }, 0);
 
+    return { session, initialMode };
+  }
+
+  async newSession(request: NewSessionRequest): Promise<NewSessionResponse> {
+    const cwd = request.cwd || process.cwd();
+    this.logger.log("newSession:", cwd);
+
+    const droid = createDroidAdapter({ cwd, logger: this.logger });
+    const initResult = await droid.start();
+
+    const sessionId = initResult.sessionId;
+    const { initialMode } = this.attachSession({ sessionId, cwd, droid, initResult });
+
     return {
       sessionId,
-      models: {
-        availableModels: initResult.availableModels.map((m) => ({
-          modelId: m.id,
-          name: m.displayName,
-        })),
-        currentModelId: initResult.settings?.modelId || "unknown",
-      },
-      modes: {
-        currentModeId: initialMode,
-        availableModes: [
-          {
-            id: "spec",
-            name: "Spec",
-            description: "Research and plan only - no code changes",
-          },
-          {
-            id: "off",
-            name: "Auto Off",
-            description: "Read-only mode - safe for reviewing planned changes without execution",
-          },
-          {
-            id: "low",
-            name: "Auto Low",
-            description: "Low-risk operations - file creation/modification, no system changes",
-          },
-          {
-            id: "medium",
-            name: "Auto Medium",
-            description: "Development operations - npm install, git commit, build commands",
-          },
-          {
-            id: "high",
-            name: "Auto High",
-            description: "Production operations - git push, deployments, database migrations",
-          },
-        ],
-      },
+      models: this.getModelsState(initResult),
+      modes: this.getModesState(initialMode),
     };
+  }
+
+  async loadSession(request: LoadSessionRequest): Promise<LoadSessionResponse> {
+    if (!isExperimentSessionsEnabled()) {
+      throw new Error(
+        "Session load is experimental. Start droid-acp with --experiment-sessions (or set DROID_ACP_EXPERIMENT_SESSIONS=1).",
+      );
+    }
+
+    const requestCwd = request.cwd || process.cwd();
+    this.logger.log("loadSession:", request.sessionId, requestCwd);
+
+    const existing = this.sessions.get(request.sessionId);
+    if (existing?.droid.isRunning()) {
+      return {
+        models: {
+          availableModels: existing.availableModels.map((m) => ({
+            modelId: m.id,
+            name: m.displayName,
+          })),
+          currentModelId: existing.model,
+        },
+        modes: this.getModesState(existing.mode),
+      };
+    }
+
+    if (existing) {
+      try {
+        await existing.droid.stop();
+      } catch {}
+      this.sessions.delete(request.sessionId);
+    }
+
+    const jsonlPath = await resolveFactorySessionJsonlPath({
+      sessionId: request.sessionId,
+      cwd: requestCwd,
+    });
+
+    const header = jsonlPath ? await readFactorySessionStart(jsonlPath) : null;
+    const cwd = header?.cwd ?? requestCwd;
+
+    const droid = createDroidAdapter({
+      cwd,
+      logger: this.logger,
+      resumeSessionId: request.sessionId,
+    });
+    const initResult = await droid.start();
+
+    if (initResult.sessionId !== request.sessionId) {
+      await droid.stop();
+      throw new Error(
+        `Failed to load session: expected ${request.sessionId} but got ${initResult.sessionId}`,
+      );
+    }
+
+    const { session, initialMode } = this.attachSession({
+      sessionId: request.sessionId,
+      cwd,
+      droid,
+      initResult,
+      title: header?.title ?? null,
+    });
+
+    if (jsonlPath) {
+      await this.replayHistoryFromJsonl(session, jsonlPath);
+    } else if (Array.isArray(initResult.session?.messages)) {
+      await this.replayHistoryFromInitMessages(session, initResult.session.messages);
+    } else {
+      throw new Error(`Session history not found for ${request.sessionId}`);
+    }
+
+    return {
+      models: this.getModelsState(initResult),
+      modes: this.getModesState(initialMode),
+    };
+  }
+
+  async unstable_listSessions(request: ListSessionsRequest): Promise<ListSessionsResponse> {
+    if (!isExperimentSessionsEnabled()) {
+      throw new Error(
+        "Session list is experimental. Start droid-acp with --experiment-sessions (or set DROID_ACP_EXPERIMENT_SESSIONS=1).",
+      );
+    }
+
+    this.logger.log(
+      "listSessions:",
+      request.cwd ?? "<unset>",
+      "cursor:",
+      request.cursor ?? "<unset>",
+    );
+    const { sessions, nextCursor } = await listFactorySessions({
+      cwd: request.cwd ?? null,
+      cursor: request.cursor ?? null,
+      preferredCwd: request.cwd ?? process.cwd(),
+    });
+    this.logger.log("listSessions result:", sessions.length, "nextCursor:", nextCursor ?? "<none>");
+
+    return {
+      sessions: sessions.map((s) => ({
+        sessionId: s.sessionId,
+        cwd: s.cwd,
+        title: s.title,
+        updatedAt: s.updatedAt,
+      })),
+      nextCursor,
+    };
+  }
+
+  async unstable_resumeSession(request: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    if (!isExperimentSessionsEnabled()) {
+      throw new Error(
+        "Session resume is experimental. Start droid-acp with --experiment-sessions (or set DROID_ACP_EXPERIMENT_SESSIONS=1).",
+      );
+    }
+
+    const cwd = request.cwd || process.cwd();
+    this.logger.log("resumeSession:", request.sessionId, cwd);
+
+    const existing = this.sessions.get(request.sessionId);
+    if (existing?.droid.isRunning()) {
+      return {
+        models: {
+          availableModels: existing.availableModels.map((m) => ({
+            modelId: m.id,
+            name: m.displayName,
+          })),
+          currentModelId: existing.model,
+        },
+        modes: this.getModesState(existing.mode),
+      };
+    }
+
+    if (existing) {
+      try {
+        await existing.droid.stop();
+      } catch {}
+      this.sessions.delete(request.sessionId);
+    }
+
+    const droid = createDroidAdapter({
+      cwd,
+      logger: this.logger,
+      resumeSessionId: request.sessionId,
+    });
+    const initResult = await droid.start();
+
+    if (initResult.sessionId !== request.sessionId) {
+      await droid.stop();
+      throw new Error(
+        `Failed to resume session: expected ${request.sessionId} but got ${initResult.sessionId}`,
+      );
+    }
+
+    const { initialMode } = this.attachSession({
+      sessionId: request.sessionId,
+      cwd,
+      droid,
+      initResult,
+    });
+
+    return {
+      models: this.getModelsState(initResult),
+      modes: this.getModesState(initialMode),
+    };
+  }
+
+  private async replayHistoryFromJsonl(session: Session, jsonlPath: string): Promise<void> {
+    this.logger.log("Replaying session history from:", jsonlPath);
+
+    for await (const entry of streamFactorySessionJsonl(jsonlPath)) {
+      const record = entry as { type?: unknown; message?: unknown; id?: unknown };
+      if (record.type !== "message") continue;
+
+      const message = record.message as {
+        role?: unknown;
+        content?: unknown;
+      };
+      const role = message?.role;
+      const content = message?.content;
+      if (role !== "user" && role !== "assistant" && role !== "system") continue;
+      if (!Array.isArray(content)) continue;
+
+      const messageId = typeof record.id === "string" ? record.id : "message";
+      await this.replayHistoryMessage(session, {
+        role,
+        id: messageId,
+        content,
+      });
+    }
+  }
+
+  private async replayHistoryFromInitMessages(
+    session: Session,
+    messages: unknown[],
+  ): Promise<void> {
+    this.logger.log("Replaying session history from init result (messages):", messages.length);
+
+    for (const entry of messages) {
+      const message = entry as { role?: unknown; content?: unknown; id?: unknown };
+      const role = message?.role;
+      const content = message?.content;
+
+      if (role !== "user" && role !== "assistant" && role !== "system") continue;
+      if (!Array.isArray(content)) continue;
+
+      const id = typeof message.id === "string" ? message.id : "message";
+      await this.replayHistoryMessage(session, {
+        role,
+        id,
+        content,
+      });
+    }
+  }
+
+  private async replayHistoryMessage(
+    session: Session,
+    message: { role: "user" | "assistant" | "system"; id: string; content: unknown[] },
+  ): Promise<void> {
+    if (message.role === "user") {
+      for (const block of message.content) {
+        const b = block as Record<string, unknown>;
+        const blockType = b.type as string | undefined;
+        if (blockType === "tool_result") {
+          const toolUseId = b.tool_use_id ?? b.toolUseId ?? b.toolUseID ?? b.tool_call_id ?? b.id;
+          const contentValue = b.content ?? b.value;
+          const isError = b.is_error ?? b.isError;
+          if (typeof toolUseId === "string") {
+            await this.handleNotification(session, {
+              type: "tool_result",
+              toolUseId,
+              content:
+                typeof contentValue === "string"
+                  ? contentValue
+                  : JSON.stringify(contentValue ?? "", null, 2),
+              isError: typeof isError === "boolean" ? isError : false,
+            });
+          }
+          continue;
+        }
+
+        if (blockType === "text") {
+          const text = typeof b.text === "string" ? b.text : "";
+          if (text.length > 0) {
+            await this.client.sessionUpdate({
+              sessionId: session.id,
+              update: {
+                sessionUpdate: "user_message_chunk",
+                content: { type: "text", text },
+              },
+            });
+          }
+          continue;
+        }
+
+        if (blockType === "image") {
+          const source = b.source as { type?: unknown; data?: unknown } | undefined;
+          const data = typeof source?.data === "string" ? source.data : null;
+          const mimeType =
+            (typeof b.media_type === "string" ? b.media_type : null) ??
+            (typeof b.mediaType === "string" ? b.mediaType : null);
+          if (data && mimeType) {
+            await this.client.sessionUpdate({
+              sessionId: session.id,
+              update: {
+                sessionUpdate: "user_message_chunk",
+                content: { type: "image", data, mimeType },
+              },
+            });
+          }
+          continue;
+        }
+      }
+      return;
+    }
+
+    if (message.role === "assistant") {
+      const textParts = message.content
+        .filter((c) => (c as Record<string, unknown>)?.type === "text")
+        .map((c) => ((c as Record<string, unknown>)?.text as string) ?? "")
+        .filter((t) => typeof t === "string" && t.length > 0);
+
+      if (textParts.length > 0) {
+        await this.handleNotification(session, {
+          type: "message",
+          role: "assistant",
+          id: message.id,
+          text: textParts.join(""),
+        });
+      }
+
+      const toolUses = message.content.filter(
+        (c) => (c as Record<string, unknown>)?.type === "tool_use",
+      );
+      for (const toolUseContent of toolUses) {
+        const u = toolUseContent as Record<string, unknown>;
+        const toolId =
+          u.id ?? u.toolUseId ?? u.tool_use_id ?? u.tool_call_id ?? u.callId ?? u.call_id;
+        const toolName = u.name ?? u.toolName ?? u.tool_name;
+        if (typeof toolId !== "string") continue;
+        await this.handleNotification(session, {
+          type: "message",
+          role: "assistant",
+          id: message.id,
+          toolUse: {
+            id: toolId,
+            name: typeof toolName === "string" ? toolName : "unknown",
+            input: u.input,
+          },
+        });
+      }
+    }
+  }
+
+  private async buildHistoryTranscriptFromJsonl(
+    jsonlPath: string,
+    maxChars: number,
+  ): Promise<string> {
+    const lines: string[] = [];
+
+    for await (const entry of streamFactorySessionJsonl(jsonlPath)) {
+      const record = entry as { type?: unknown; message?: unknown };
+      if (record.type !== "message") continue;
+
+      const message = record.message as { role?: unknown; content?: unknown };
+      const role = message?.role;
+      const content = message?.content;
+      if (role !== "user" && role !== "assistant") continue;
+      if (!Array.isArray(content)) continue;
+
+      const textParts = content
+        .filter((c) => {
+          const obj = c as Record<string, unknown>;
+          return obj.type === "text" && typeof obj.text === "string";
+        })
+        .map((c) => (c as { text: string }).text.trim())
+        .filter((t) => t.length > 0)
+        .filter((t) => !t.includes("<system-reminder>"));
+
+      if (textParts.length === 0) continue;
+
+      const label = role === "user" ? "User" : "Assistant";
+      lines.push(`${label}: ${textParts.join("")}`);
+    }
+
+    const transcript = lines.join("\n\n").trim();
+    if (transcript.length <= maxChars) return transcript;
+    return transcript.slice(transcript.length - maxChars);
   }
 
   async prompt(request: PromptRequest): Promise<PromptResponse> {
@@ -409,12 +845,41 @@ export class DroidAcpAgent implements Agent {
       text = "Please see the attached image(s).";
     }
 
+    const derivedTitle = (() => {
+      const firstLine = text
+        .split("\n")
+        .map((l) => l.trim())
+        .find((l) => l.length > 0);
+      if (!firstLine) return null;
+      return firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine;
+    })();
+
+    const now = new Date().toISOString();
+    session.updatedAt = now;
+    if ((!session.title || session.title === "New Session") && derivedTitle) {
+      session.title = derivedTitle;
+    }
+    void this.client.sessionUpdate({
+      sessionId: session.id,
+      update: {
+        sessionUpdate: "session_info_update",
+        title: session.title,
+        updatedAt: session.updatedAt,
+      },
+    });
+
     // Handle slash commands
     if (text.startsWith("/")) {
       const handled = await this.handleSlashCommand(session, text);
       if (handled) {
         return { stopReason: "end_turn" };
       }
+    }
+
+    if (session.pendingHistoryContext) {
+      const historyContext = session.pendingHistoryContext;
+      session.pendingHistoryContext = null;
+      text = `<context ref="session_history">\n${historyContext}\n</context>\n\n${text}`.trim();
     }
 
     // Send message and wait for completion
@@ -582,6 +1047,151 @@ export class DroidAcpAgent implements Agent {
           `- Droid Running: ${session.droid.isRunning()}`,
         ].join("\n");
         await this.sendAgentMessage(session, status);
+        return true;
+      }
+
+      case "sessions": {
+        if (!isExperimentSessionsEnabled()) {
+          await this.sendAgentMessage(
+            session,
+            "Experimental feature disabled.\n\nEnable with `npx droid-acp --experiment-sessions` (or set `DROID_ACP_EXPERIMENT_SESSIONS=1`).",
+          );
+          return true;
+        }
+
+        const parts = trimmedArgs.split(/\s+/).filter((p) => p.length > 0);
+        const sub = parts[0]?.toLowerCase();
+
+        if (!sub || sub === "list") {
+          const { sessions } = await listFactorySessions({
+            cwd: session.cwd,
+            cursor: null,
+            pageSize: 20,
+          });
+
+          if (sessions.length === 0) {
+            await this.sendAgentMessage(
+              session,
+              `No sessions found for:\n\n- cwd: \`${session.cwd}\`\n\nTry: \`/sessions all\``,
+            );
+            return true;
+          }
+
+          const lines = sessions.map((s) => {
+            const time = s.updatedAt ? ` — ${s.updatedAt}` : "";
+            const title = s.title ? ` — ${s.title}` : "";
+            return `- \`${s.sessionId}\`${title}${time}`;
+          });
+
+          await this.sendAgentMessage(
+            session,
+            [
+              `**Sessions (${session.cwd})**`,
+              "",
+              ...lines,
+              "",
+              "Use: `/sessions load <session_id>`",
+            ]
+              .join("\n")
+              .trim(),
+          );
+          return true;
+        }
+
+        if (sub === "all") {
+          const { sessions } = await listFactorySessions({
+            cwd: null,
+            cursor: null,
+            pageSize: 20,
+            preferredCwd: session.cwd,
+          });
+
+          if (sessions.length === 0) {
+            await this.sendAgentMessage(session, "No sessions found in local history.");
+            return true;
+          }
+
+          const lines = sessions.map((s) => {
+            const time = s.updatedAt ? ` — ${s.updatedAt}` : "";
+            const title = s.title ? ` — ${s.title}` : "";
+            return `- \`${s.sessionId}\` (${s.cwd})${title}${time}`;
+          });
+
+          await this.sendAgentMessage(
+            session,
+            ["**Recent Sessions**", "", ...lines, "", "Use: `/sessions load <session_id>`"]
+              .join("\n")
+              .trim(),
+          );
+          return true;
+        }
+
+        if (sub === "load" && typeof parts[1] === "string" && parts[1].length > 0) {
+          const targetSessionId = parts[1];
+          await this.sendAgentMessage(session, `Loading session: \`${targetSessionId}\`…`);
+
+          const jsonlPath = await resolveFactorySessionJsonlPath({
+            sessionId: targetSessionId,
+            cwd: session.cwd,
+          });
+          if (!jsonlPath) {
+            await this.sendAgentMessage(
+              session,
+              `Session history not found on disk for: \`${targetSessionId}\``,
+            );
+            return true;
+          }
+
+          const header = await readFactorySessionStart(jsonlPath);
+          const cwd = header?.cwd ?? session.cwd;
+
+          try {
+            await session.droid.stop();
+          } catch {}
+
+          let droid = createDroidAdapter({
+            cwd,
+            logger: this.logger,
+            resumeSessionId: targetSessionId,
+          });
+          let initResult = await droid.start();
+          const resumed = initResult.sessionId === targetSessionId;
+          if (!resumed) {
+            try {
+              await droid.stop();
+            } catch {}
+            droid = createDroidAdapter({ cwd, logger: this.logger });
+            initResult = await droid.start();
+          }
+
+          const { session: newSession } = this.attachSession({
+            sessionId: session.id,
+            cwd,
+            droid,
+            initResult,
+            title: header?.title ?? null,
+          });
+
+          await this.replayHistoryFromJsonl(newSession, jsonlPath);
+          if (resumed) {
+            await this.sendAgentMessage(newSession, `Loaded session: \`${targetSessionId}\``);
+          } else {
+            const transcript = await this.buildHistoryTranscriptFromJsonl(jsonlPath, 12000);
+            if (transcript.length > 0) {
+              newSession.pendingHistoryContext = transcript;
+            }
+            await this.sendAgentMessage(
+              newSession,
+              `Loaded history from disk for \`${targetSessionId}\`, but Droid could not resume this session id.\n\nYour next message will include a transcript as context (so Droid can continue without a Factory login).`,
+            );
+          }
+          return true;
+        }
+
+        await this.sendAgentMessage(
+          session,
+          "Usage:\n\n- `/sessions` (list current cwd)\n- `/sessions all` (list global)\n- `/sessions load <session_id>`",
+        );
         return true;
       }
 

@@ -15,6 +15,7 @@ import type {
 export interface DroidAdapterOptions {
   cwd: string;
   logger?: Logger;
+  resumeSessionId?: string;
 }
 
 export interface DroidAdapter {
@@ -396,6 +397,9 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
         "--cwd",
         options.cwd,
       ];
+      if (typeof options.resumeSessionId === "string" && options.resumeSessionId.length > 0) {
+        args.push("--session-id", options.resumeSessionId);
+      }
 
       logger.log("Starting droid:", executable, args.join(" "));
 
