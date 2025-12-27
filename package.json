@@ -1,10 +1,18 @@
 {
   "name": "droid-acp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "ACP adapter for Droid - Factory's AI coding agent",
   "type": "module",
   "main": "dist/lib.mjs",
   "types": "dist/lib.d.mts",
+  "homepage": "https://github.com/kingsword09/droid-acp#readme",
+  "bugs": {
+    "url": "https://github.com/kingsword09/droid-acp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kingsword09/droid-acp.git"
+  },
   "bin": {
     "droid-acp": "./dist/index.mjs"
   },
@@ -30,7 +38,7 @@
     "typescript",
     "code"
   ],
-  "author": "",
+  "author": "Kingsword kingsword09 <kingsword09@gmail.com>",
   "license": "Apache-2.0",
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.12.0"
