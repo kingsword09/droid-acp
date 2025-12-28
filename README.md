@@ -280,6 +280,15 @@ Notes:
 - Gemini 3 Pro
 - Droid Core (GLM-4.6)
 
+## Project Structure
+
+- `src/acp/agent/` - ACP `Agent` implementation (sessions, prompts, slash commands)
+- `src/acp/notifications/` - Droid notifications → ACP updates
+- `src/acp/permissions/` - Permission prompts, diffs, and auto-approval logic
+- `src/acp/session/` - Session attach/restart helpers
+- `src/websearch-proxy.ts` - Optional local WebSearch proxy
+- `src/acp-agent.ts` - Public entry point (re-exports `DroidAcpAgent`, `runAcp` from `src/acp/`)
+
 ## Development
 
 ```bash
