@@ -115,7 +115,6 @@ Add to your Zed `settings.json`:
       "command": "npx",
       "args": ["droid-acp"],
       "env": {
-        "DROID_ACP_WEBSEARCH": "1",
         "SMITHERY_API_KEY": "your_smithery_key",
         "SMITHERY_PROFILE": "your_profile_id"
       }
@@ -156,9 +155,9 @@ Add to your Zed `settings.json`:
 - `DROID_ACP_REASONING_EFFORT` - Initial reasoning effort passed to `droid exec --reasoning-effort` (optional)
 - `DROID_DEBUG` - Enable adapter debug UI output (raw tool inputs, websearch proxy status, raw events)
 
-- `DROID_ACP_WEBSEARCH` - Enable local proxy to optionally intercept Droid websearch (`/api/tools/exa/search`)
+- `DROID_ACP_WEBSEARCH` - Enable local WebSearch proxy. When unset, the proxy auto-enables if `SMITHERY_API_KEY`+`SMITHERY_PROFILE` or `DROID_ACP_WEBSEARCH_FORWARD_URL` is set (set to `0` to force disable).
 - `DROID_ACP_WEBSEARCH_FORWARD_URL` - Optional forward target for websearch (base URL or full URL)
-- `DROID_ACP_WEBSEARCH_FORWARD_MODE` - Forward mode for `DROID_ACP_WEBSEARCH_FORWARD_URL` (`http` or `mcp`, default: `http`)
+- `DROID_ACP_WEBSEARCH_FORWARD_MODE` - (Legacy) Forward mode for `DROID_ACP_WEBSEARCH_FORWARD_URL` (`http` or `mcp`, default: `http`). Prefer `mcp:` prefix in the forward URL.
 - `DROID_ACP_WEBSEARCH_UPSTREAM_URL` - Optional upstream Factory API base URL (default: `FACTORY_API_BASE_URL_OVERRIDE` or `https://api.factory.ai`)
 - `DROID_ACP_WEBSEARCH_HOST` - Optional proxy bind host (default: `127.0.0.1`)
 - `DROID_ACP_WEBSEARCH_PORT` - Optional proxy bind port (default: auto-assign an available port)
@@ -173,19 +172,18 @@ Enable the built-in proxy to intercept `POST /api/tools/exa/search` and serve re
 ```bash
 export SMITHERY_API_KEY="your_smithery_key"
 export SMITHERY_PROFILE="your_profile_id"
-DROID_ACP_WEBSEARCH=1 npx droid-acp
+npx droid-acp
 ```
 
 To debug proxy wiring (shows `proxyBaseUrl` and a `/health` link in the ACP UI):
 
 ```bash
-DROID_ACP_WEBSEARCH=1 DROID_DEBUG=1 npx droid-acp
+DROID_DEBUG=1 npx droid-acp
 ```
 
 To forward WebSearch to your own HTTP handler instead:
 
 ```bash
-DROID_ACP_WEBSEARCH=1 \
 DROID_ACP_WEBSEARCH_FORWARD_URL="http://127.0.0.1:20002" \
 npx droid-acp
 ```
@@ -193,16 +191,14 @@ npx droid-acp
 To forward WebSearch to an MCP endpoint (JSON-RPC `tools/call`), set:
 
 ```bash
-DROID_ACP_WEBSEARCH=1 \
-DROID_ACP_WEBSEARCH_FORWARD_MODE=mcp \
-DROID_ACP_WEBSEARCH_FORWARD_URL="http://127.0.0.1:20002" \
+DROID_ACP_WEBSEARCH_FORWARD_URL="mcp:http://127.0.0.1:20002" \
 npx droid-acp
 ```
 
 Notes:
 
 - The proxy exposes `GET /health` on `proxyBaseUrl` (handy for troubleshooting).
-- When `DROID_ACP_WEBSEARCH=1`, droid-acp injects a dummy `FACTORY_API_KEY` into the spawned droid process if none is set, so WebSearch requests can reach the proxy even without Factory login.
+- When the WebSearch proxy is enabled, droid-acp injects a dummy `FACTORY_API_KEY` into the spawned droid process if none is set, so WebSearch requests can reach the proxy even without Factory login.
 - The proxy forces `Accept-Encoding: identity` upstream and strips `content-encoding`/`content-length` when proxying to avoid Brotli decompression errors in some client setups.
 
 ## Sessions (History / Resume)
