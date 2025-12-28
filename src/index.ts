@@ -180,10 +180,12 @@ function runNativeAcp(): void {
       // Signal handling (works on Unix, limited on Windows)
       process.on("SIGTERM", cleanup);
       process.on("SIGINT", cleanup);
-      process.on("exit", cleanup);
       if (isWindows) {
+        process.on("SIGBREAK", cleanup);
+      } else {
         process.on("SIGHUP", cleanup);
       }
+      process.on("exit", cleanup);
     })
     .catch((err: unknown) => {
       console.error("[droid-acp] Failed to start websearch proxy:", err);
