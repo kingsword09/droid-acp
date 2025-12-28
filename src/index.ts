@@ -62,19 +62,45 @@ function runNativeAcp(): void {
   };
 
   const startWebsearchProxyIfEnabled = async () => {
-    if (!isEnvEnabled(env.DROID_ACP_WEBSEARCH)) return;
+    const hasExplicitToggle = typeof env.DROID_ACP_WEBSEARCH === "string";
+    const smitheryConfigured =
+      typeof env.SMITHERY_API_KEY === "string" &&
+      env.SMITHERY_API_KEY.trim().length > 0 &&
+      typeof env.SMITHERY_PROFILE === "string" &&
+      env.SMITHERY_PROFILE.trim().length > 0;
+    const forwardConfigured =
+      typeof env.DROID_ACP_WEBSEARCH_FORWARD_URL === "string" &&
+      env.DROID_ACP_WEBSEARCH_FORWARD_URL.trim().length > 0;
+
+    const enableWebsearchProxy = hasExplicitToggle
+      ? isEnvEnabled(env.DROID_ACP_WEBSEARCH)
+      : smitheryConfigured || forwardConfigured;
+
+    if (!enableWebsearchProxy) return;
 
     const upstreamBaseUrl =
       env.DROID_ACP_WEBSEARCH_UPSTREAM_URL ??
       env.FACTORY_API_BASE_URL_OVERRIDE ??
       "https://api.factory.ai";
 
-    const websearchForwardUrl = env.DROID_ACP_WEBSEARCH_FORWARD_URL;
     const forwardModeRaw = env.DROID_ACP_WEBSEARCH_FORWARD_MODE;
+
+    const forwardUrlRaw =
+      typeof env.DROID_ACP_WEBSEARCH_FORWARD_URL === "string"
+        ? env.DROID_ACP_WEBSEARCH_FORWARD_URL.trim()
+        : "";
+    const forwardPrefixMatch = forwardUrlRaw.match(/^mcp:(.*)$/i);
+    const websearchForwardUrl = forwardUrlRaw.length > 0 ? forwardUrlRaw : undefined;
+    const forwardModeNormalized =
+      typeof forwardModeRaw === "string" ? forwardModeRaw.trim().toLowerCase() : "";
     const websearchForwardMode =
-      typeof forwardModeRaw === "string" && forwardModeRaw.trim().toLowerCase() === "mcp"
+      forwardModeNormalized === "mcp"
         ? ("mcp" as const)
-        : ("http" as const);
+        : forwardModeNormalized === "http"
+          ? ("http" as const)
+          : forwardPrefixMatch
+            ? ("mcp" as const)
+            : ("http" as const);
 
     const host = env.DROID_ACP_WEBSEARCH_HOST ?? "127.0.0.1";
 
@@ -90,7 +116,7 @@ function runNativeAcp(): void {
 
     websearchProxy = await startWebsearchProxy({
       upstreamBaseUrl,
-      websearchForwardUrl,
+      websearchForwardUrl: forwardPrefixMatch ? forwardPrefixMatch[1]?.trim() : websearchForwardUrl,
       websearchForwardMode,
       smitheryApiKey: env.SMITHERY_API_KEY,
       smitheryProfile: env.SMITHERY_PROFILE,

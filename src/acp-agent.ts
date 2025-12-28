@@ -450,8 +450,32 @@ export class DroidAcpAgent implements Agent {
     if (shouldEmitWebsearchStatus) {
       const websearchProxyBaseUrl = droid.getWebsearchProxyBaseUrl();
       const parentFactoryApiKey = process.env.FACTORY_API_KEY;
-      const willInjectDummyFactoryApiKey =
-        isEnvEnabled(process.env.DROID_ACP_WEBSEARCH) && !parentFactoryApiKey;
+      const hasExplicitToggle = typeof process.env.DROID_ACP_WEBSEARCH === "string";
+      const smitheryConfigured =
+        typeof process.env.SMITHERY_API_KEY === "string" &&
+        process.env.SMITHERY_API_KEY.trim().length > 0 &&
+        typeof process.env.SMITHERY_PROFILE === "string" &&
+        process.env.SMITHERY_PROFILE.trim().length > 0;
+      const forwardConfigured =
+        typeof process.env.DROID_ACP_WEBSEARCH_FORWARD_URL === "string" &&
+        process.env.DROID_ACP_WEBSEARCH_FORWARD_URL.trim().length > 0;
+      const websearchEnabled = hasExplicitToggle
+        ? isEnvEnabled(process.env.DROID_ACP_WEBSEARCH)
+        : smitheryConfigured || forwardConfigured;
+      const willInjectDummyFactoryApiKey = websearchEnabled && !parentFactoryApiKey;
+
+      const forwardModeRaw = process.env.DROID_ACP_WEBSEARCH_FORWARD_MODE;
+      const forwardModeNormalized =
+        typeof forwardModeRaw === "string" ? forwardModeRaw.trim().toLowerCase() : "";
+      const forwardUrlRaw = process.env.DROID_ACP_WEBSEARCH_FORWARD_URL ?? "";
+      const forwardModeEffective =
+        forwardModeNormalized === "mcp"
+          ? "mcp"
+          : forwardModeNormalized === "http"
+            ? "http"
+            : /^mcp:/i.test(forwardUrlRaw.trim())
+              ? "mcp"
+              : "http";
       setTimeout(() => {
         void this.client.sessionUpdate({
           sessionId,
@@ -463,8 +487,10 @@ export class DroidAcpAgent implements Agent {
                 [
                   "[droid-acp] WebSearch status",
                   `- DROID_ACP_WEBSEARCH: ${process.env.DROID_ACP_WEBSEARCH ?? "<unset>"}`,
+                  `- enabled: ${websearchEnabled ? "true" : "false"}${hasExplicitToggle ? "" : " (auto)"}`,
                   `- DROID_ACP_WEBSEARCH_PORT: ${process.env.DROID_ACP_WEBSEARCH_PORT ?? "<unset>"}`,
                   `- DROID_ACP_WEBSEARCH_FORWARD_MODE: ${process.env.DROID_ACP_WEBSEARCH_FORWARD_MODE ?? "<unset>"}`,
+                  `- forwardMode: ${forwardModeEffective}`,
                   `- DROID_ACP_WEBSEARCH_FORWARD_URL: ${process.env.DROID_ACP_WEBSEARCH_FORWARD_URL ?? "<unset>"}`,
                   `- FACTORY_API_KEY: ${parentFactoryApiKey ? "set" : "<unset>"}${willInjectDummyFactoryApiKey ? " (droid child auto-inject dummy)" : ""}`,
                   `- SMITHERY_API_KEY: ${process.env.SMITHERY_API_KEY ? "set" : "<unset>"}`,
