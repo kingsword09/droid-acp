@@ -22,8 +22,14 @@ import {
   type SetSessionModeRequest,
   type SetSessionModeResponse,
   type PermissionOption,
+  type ToolCallContent,
+  type ToolCallLocation,
+  type ToolKind,
   ndJsonStream,
 } from "@agentclientprotocol/sdk";
+import os from "node:os";
+import path from "node:path";
+import { readFile, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { createDroidAdapter, type DroidAdapter } from "./droid-adapter.ts";
 import {
@@ -91,6 +97,10 @@ function formatTimestampForDisplay(isoTimestamp: string): string {
   if (Number.isNaN(d.getTime())) return isoTimestamp;
   const pad2 = (v: number) => String(v).padStart(2, "0");
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+
+function safeCodeFenceContent(text: string): string {
+  return text.replace(/```/g, "``\u200b`");
 }
 
 function normalizeBase64DataUrl(
@@ -191,6 +201,8 @@ interface Session {
     scope: "cwd" | "all";
     sessions: FactorySessionRecord[];
   } | null;
+  toolCallContentById: Map<string, ToolCallContent[]>;
+  toolCallRawInputById: Map<string, unknown>;
   activeToolCallIds: Set<string>;
   toolCallStatus: Map<string, "pending" | "in_progress" | "completed" | "failed">;
   toolNames: Map<string, string>;
@@ -352,6 +364,8 @@ export class DroidAcpAgent implements Agent {
       promptResolve: null,
       capture: null,
       lastSessionsListing: null,
+      toolCallContentById: new Map(),
+      toolCallRawInputById: new Map(),
       activeToolCallIds: new Set(),
       toolCallStatus: new Map(),
       toolNames: new Map(),
@@ -431,9 +445,8 @@ export class DroidAcpAgent implements Agent {
     }, 0);
 
     // Optional diagnostics for Zed env + websearch proxy wiring.
-    // Enable with DROID_ACP_WEBSEARCH_DEBUG=1 (or DROID_DEBUG=1).
-    const shouldEmitWebsearchStatus =
-      isEnvEnabled(process.env.DROID_ACP_WEBSEARCH_DEBUG) || isEnvEnabled(process.env.DROID_DEBUG);
+    // Enable with DROID_DEBUG=1.
+    const shouldEmitWebsearchStatus = isEnvEnabled(process.env.DROID_DEBUG);
     if (shouldEmitWebsearchStatus) {
       const websearchProxyBaseUrl = droid.getWebsearchProxyBaseUrl();
       const parentFactoryApiKey = process.env.FACTORY_API_KEY;
@@ -1801,13 +1814,13 @@ export class DroidAcpAgent implements Agent {
     return [];
   }
 
-  private handlePermission(
+  private async handlePermission(
     session: Session,
     params: PermissionRequest,
   ): Promise<{ selectedOption: string }> {
     const toolUse = params.toolUses?.[0]?.toolUse;
     if (!toolUse) {
-      return Promise.resolve({ selectedOption: "proceed_once" });
+      return { selectedOption: "proceed_once" };
     }
 
     const toolCallId = toolUse.id;
@@ -1845,23 +1858,38 @@ export class DroidAcpAgent implements Agent {
         ? spec?.title
           ? `Exit spec mode: ${spec.title}`
           : "Exit spec mode"
-        : `Running ${toolName} (${riskLevel}): ${commandSummary}`;
-    const toolCallKind = toolName === "ExitSpecMode" ? ("switch_mode" as const) : undefined;
-    const toolCallContent =
-      toolName === "ExitSpecMode" && spec?.plan
-        ? [
-            {
-              type: "content" as const,
-              content: { type: "text" as const, text: spec.plan },
-            },
-          ]
-        : undefined;
+        : this.formatPermissionToolCallTitle({
+            toolName,
+            riskLevel,
+            rawInput,
+            cwd: session.cwd,
+          });
+
+    const toolCallKind: ToolKind =
+      toolName === "ExitSpecMode" ? "switch_mode" : this.toolKindFromToolName(toolName);
+
+    const toolCallLocations = this.permissionLocationsFromRawInput({
+      toolName,
+      rawInput,
+      cwd: session.cwd,
+    });
+
+    const toolCallContent = await this.buildPermissionToolCallContent({
+      toolName,
+      riskLevel,
+      rawInput,
+      cwd: session.cwd,
+      planMarkdown: toolName === "ExitSpecMode" ? (spec?.plan ?? null) : null,
+    });
 
     // Emit tool_call (pending), de-duping if the tool call was already created from a tool_use block.
     const alreadyTracked = session.activeToolCallIds.has(toolCallId);
     session.activeToolCallIds.add(toolCallId);
     session.toolNames.set(toolCallId, toolName);
     session.toolCallStatus.set(toolCallId, "pending");
+    session.toolCallRawInputById.set(toolCallId, rawInput);
+    session.toolCallContentById.set(toolCallId, toolCallContent);
+    const rawInputForClient = this.toolCallRawInputForClient(rawInput);
 
     if (alreadyTracked) {
       void this.client.sessionUpdate({
@@ -1873,7 +1901,8 @@ export class DroidAcpAgent implements Agent {
           status: "pending",
           kind: toolCallKind,
           content: toolCallContent,
-          rawInput,
+          locations: toolCallLocations,
+          rawInput: rawInputForClient,
         },
       });
     } else {
@@ -1886,7 +1915,8 @@ export class DroidAcpAgent implements Agent {
           status: "pending",
           kind: toolCallKind,
           content: toolCallContent,
-          rawInput,
+          locations: toolCallLocations,
+          rawInput: rawInputForClient,
         },
       });
     }
@@ -1894,11 +1924,395 @@ export class DroidAcpAgent implements Agent {
     return this.decidePermission(session, {
       toolCallId,
       toolName,
+      toolCallTitle,
       command: commandSummary,
       riskLevel,
       rawInput,
+      toolCallKind,
+      toolCallContent,
+      toolCallLocations,
       droidOptions: this.extractDroidPermissionOptions(params),
     });
+  }
+
+  private toolCallRawInputForClient(rawInput: unknown): unknown {
+    return isEnvEnabled(process.env.DROID_DEBUG) ? rawInput : undefined;
+  }
+
+  private formatPermissionDetailsMarkdown(params: {
+    toolName: string;
+    riskLevel: "low" | "medium" | "high";
+    rawInput: unknown;
+  }): string {
+    const lines: string[] = [
+      "**Details**",
+      `- Tool: \`${params.toolName}\``,
+      `- Risk: \`${params.riskLevel}\``,
+    ];
+
+    const rawInputObj =
+      params.rawInput && typeof params.rawInput === "object"
+        ? (params.rawInput as Record<string, unknown>)
+        : null;
+
+    const command =
+      rawInputObj && typeof rawInputObj.command === "string" ? rawInputObj.command.trim() : null;
+
+    if (command && command.length > 0) {
+      lines.push("", "**Command**", "```bash", safeCodeFenceContent(command), "```");
+      return lines.join("\n");
+    }
+
+    const inputSummary: string[] = [];
+    const pushField = (label: string, value: unknown) => {
+      if (typeof value !== "string") return;
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      inputSummary.push(`- ${label}: \`${trimmed}\``);
+    };
+
+    if (rawInputObj) {
+      pushField("From", rawInputObj.from_path ?? rawInputObj.fromPath ?? rawInputObj.from);
+      pushField("To", rawInputObj.to_path ?? rawInputObj.toPath ?? rawInputObj.to);
+      pushField("Path", rawInputObj.path);
+      pushField("File", rawInputObj.file);
+      pushField("File path", rawInputObj.file_path ?? rawInputObj.filePath);
+      pushField("URL", rawInputObj.url);
+      pushField("Query", rawInputObj.query);
+      pushField("Pattern", rawInputObj.pattern);
+      pushField("Glob", rawInputObj.glob);
+    }
+
+    if (inputSummary.length > 0) {
+      lines.push("", "**Input (summary)**", ...inputSummary);
+    }
+
+    const shouldShowRawInput = isEnvEnabled(process.env.DROID_DEBUG);
+
+    if (shouldShowRawInput) {
+      const scrubbed = (() => {
+        if (!rawInputObj) return params.rawInput;
+        const out: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(rawInputObj)) {
+          if (typeof v === "string" && v.length > 1200) {
+            out[k] = `${v.slice(0, 1200)}… (truncated, ${v.length} chars)`;
+            continue;
+          }
+          out[k] = v;
+        }
+        return out;
+      })();
+
+      let json: string | null = null;
+      try {
+        json = JSON.stringify(scrubbed, null, 2);
+      } catch {
+        json = null;
+      }
+
+      if (json && json !== "{}") {
+        const maxChars = 12_000;
+        const truncated =
+          json.length > maxChars ? `${json.slice(0, maxChars)}\n… (truncated)` : json;
+        lines.push("", "**Input (raw)**", "```json", safeCodeFenceContent(truncated), "```");
+      }
+    }
+
+    return lines.join("\n");
+  }
+
+  private formatPermissionToolCallTitle(params: {
+    stage?: "permission" | "run";
+    toolName: string;
+    riskLevel: "low" | "medium" | "high";
+    rawInput: unknown;
+    cwd: string;
+  }): string {
+    const stage = params.stage ?? "permission";
+    const rawInputObj =
+      params.rawInput && typeof params.rawInput === "object"
+        ? (params.rawInput as Record<string, unknown>)
+        : null;
+
+    const filePath = this.extractFilePathFromRawInput(rawInputObj);
+    const resolvedPath = filePath
+      ? this.resolvePermissionFilePath(params.cwd, filePath).label
+      : null;
+
+    if (params.toolName === "Bash") {
+      const command =
+        rawInputObj && typeof rawInputObj.command === "string" ? rawInputObj.command.trim() : null;
+      const firstLine = command ? (command.split(/\r?\n/, 1)[0]?.trim() ?? "") : "";
+      const summary = firstLine.length > 0 ? firstLine : "command";
+      return stage === "permission" ? `Run (${params.riskLevel}): ${summary}` : `Run: ${summary}`;
+    }
+
+    if (params.toolName === "Fetch") {
+      const url =
+        rawInputObj && typeof rawInputObj.url === "string" ? rawInputObj.url.trim() : null;
+      if (url && url.length > 0) return `Fetch: ${url}`;
+    }
+
+    if (resolvedPath) {
+      const prefix = params.toolName === "LS" ? "List" : params.toolName;
+      return stage === "permission"
+        ? `${prefix} (${params.riskLevel}): ${resolvedPath}`
+        : `${prefix}: ${resolvedPath}`;
+    }
+
+    if (params.toolName === "Grep" || params.toolName === "Glob") {
+      const pattern =
+        rawInputObj && typeof rawInputObj.pattern === "string" ? rawInputObj.pattern.trim() : null;
+      if (pattern && pattern.length > 0) {
+        return stage === "permission"
+          ? `${params.toolName} (${params.riskLevel}): ${pattern}`
+          : `${params.toolName}: ${pattern}`;
+      }
+    }
+
+    return stage === "permission"
+      ? `Permission required: ${params.toolName} (${params.riskLevel})`
+      : `Running ${params.toolName}`;
+  }
+
+  private toolKindFromToolName(toolName: string): ToolKind {
+    switch (toolName) {
+      case "Read":
+      case "LS":
+        return "read";
+      case "Grep":
+      case "Glob":
+        return "search";
+      case "Edit":
+      case "Write":
+        return "edit";
+      case "Move":
+        return "move";
+      case "Delete":
+        return "delete";
+      case "Bash":
+        return "execute";
+      case "Fetch":
+        return "fetch";
+      default:
+        return "other";
+    }
+  }
+
+  private extractFilePathFromRawInput(rawInput: unknown): string | null {
+    if (!rawInput || typeof rawInput !== "object") return null;
+    const obj = rawInput as Record<string, unknown>;
+    const candidates: unknown[] = [obj.file_path, obj.filePath, obj.path];
+    for (const v of candidates) {
+      if (typeof v === "string" && v.trim().length > 0) return v.trim();
+    }
+    return null;
+  }
+
+  private resolvePermissionFilePath(
+    cwd: string,
+    filePath: string,
+  ): { absPath: string; label: string } {
+    const expanded = (() => {
+      const trimmed = filePath.trim();
+      if (trimmed === "~") return os.homedir();
+      if (trimmed.startsWith("~/")) return path.join(os.homedir(), trimmed.slice(2));
+      return trimmed;
+    })();
+
+    const absPath = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+    const label = absPath.startsWith(cwd + path.sep) ? path.relative(cwd, absPath) : absPath;
+    return { absPath, label };
+  }
+
+  private permissionLocationsFromRawInput(params: {
+    toolName: string;
+    rawInput: unknown;
+    cwd: string;
+  }): ToolCallLocation[] | undefined {
+    const wantsLocation = new Set([
+      "Edit",
+      "Write",
+      "Read",
+      "LS",
+      "Grep",
+      "Glob",
+      "Move",
+      "Delete",
+    ]);
+    if (!wantsLocation.has(params.toolName)) return undefined;
+
+    const rawInputObj =
+      params.rawInput && typeof params.rawInput === "object"
+        ? (params.rawInput as Record<string, unknown>)
+        : null;
+    if (!rawInputObj) return undefined;
+
+    const normalize = (v: unknown): string | null => {
+      if (typeof v !== "string") return null;
+      const trimmed = v.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    };
+
+    const addLocation = (acc: ToolCallLocation[], value: string | null) => {
+      if (!value) return;
+      const resolved = this.resolvePermissionFilePath(params.cwd, value);
+      if (acc.some((l) => l.path === resolved.label)) return;
+      acc.push({ path: resolved.label });
+    };
+
+    const locations: ToolCallLocation[] = [];
+
+    if (params.toolName === "Move") {
+      addLocation(
+        locations,
+        normalize(
+          rawInputObj.from_path ?? rawInputObj.fromPath ?? rawInputObj.source ?? rawInputObj.from,
+        ),
+      );
+      addLocation(
+        locations,
+        normalize(
+          rawInputObj.to_path ?? rawInputObj.toPath ?? rawInputObj.destination ?? rawInputObj.to,
+        ),
+      );
+    }
+
+    if (locations.length === 0) {
+      addLocation(locations, this.extractFilePathFromRawInput(rawInputObj));
+    }
+
+    return locations.length > 0 ? locations : undefined;
+  }
+
+  private async buildPermissionToolCallContent(params: {
+    toolName: string;
+    riskLevel: "low" | "medium" | "high";
+    rawInput: unknown;
+    cwd: string;
+    planMarkdown: string | null;
+  }): Promise<ToolCallContent[]> {
+    if (params.toolName === "ExitSpecMode" && params.planMarkdown) {
+      return [
+        {
+          type: "content",
+          content: { type: "text", text: params.planMarkdown },
+        },
+      ];
+    }
+
+    const content: ToolCallContent[] = [];
+    const diff = await this.buildPermissionDiffContent({
+      toolName: params.toolName,
+      rawInput: params.rawInput,
+      cwd: params.cwd,
+    });
+    if (diff) content.push(diff);
+
+    content.push({
+      type: "content",
+      content: {
+        type: "text",
+        text: this.formatPermissionDetailsMarkdown({
+          toolName: params.toolName,
+          riskLevel: params.riskLevel,
+          rawInput: params.rawInput,
+        }),
+      },
+    });
+
+    return content;
+  }
+
+  private async buildPermissionDiffContent(params: {
+    toolName: string;
+    rawInput: unknown;
+    cwd: string;
+  }): Promise<ToolCallContent | null> {
+    const rawInputObj =
+      params.rawInput && typeof params.rawInput === "object"
+        ? (params.rawInput as Record<string, unknown>)
+        : null;
+    if (!rawInputObj) return null;
+
+    const filePath = this.extractFilePathFromRawInput(rawInputObj);
+    if (!filePath) return null;
+    const resolved = this.resolvePermissionFilePath(params.cwd, filePath);
+
+    const MAX_FILE_BYTES = 256 * 1024;
+
+    if (params.toolName === "Edit") {
+      const oldStr =
+        typeof rawInputObj.old_str === "string"
+          ? rawInputObj.old_str
+          : typeof rawInputObj.oldStr === "string"
+            ? rawInputObj.oldStr
+            : null;
+      const newStr =
+        typeof rawInputObj.new_str === "string"
+          ? rawInputObj.new_str
+          : typeof rawInputObj.newStr === "string"
+            ? rawInputObj.newStr
+            : null;
+      if (oldStr === null || newStr === null) return null;
+
+      // Best-effort: show a full-file diff when we can apply a single unambiguous replacement.
+      try {
+        const fileStat = await stat(resolved.absPath);
+        if (fileStat.isFile() && fileStat.size <= MAX_FILE_BYTES && oldStr.length > 0) {
+          const oldText = await readFile(resolved.absPath, "utf8");
+          const occurrences = oldText.split(oldStr).length - 1;
+          if (occurrences === 1) {
+            const newText = oldText.replace(oldStr, newStr);
+            return {
+              type: "diff",
+              path: resolved.label,
+              oldText,
+              newText,
+            };
+          }
+        }
+      } catch {
+        // Fall back to a snippet diff below.
+      }
+
+      // Fallback: show a focused snippet diff of the replacement only.
+      return {
+        type: "diff",
+        path: resolved.label,
+        oldText: oldStr,
+        newText: newStr,
+      };
+    }
+
+    if (params.toolName === "Write") {
+      const newText =
+        typeof rawInputObj.content === "string"
+          ? rawInputObj.content
+          : typeof rawInputObj.text === "string"
+            ? rawInputObj.text
+            : null;
+      if (newText === null) return null;
+
+      let oldText: string | null = null;
+      try {
+        const fileStat = await stat(resolved.absPath);
+        if (fileStat.isFile() && fileStat.size <= MAX_FILE_BYTES) {
+          oldText = await readFile(resolved.absPath, "utf8");
+        }
+      } catch {
+        oldText = null;
+      }
+
+      return {
+        type: "diff",
+        path: resolved.label,
+        oldText,
+        newText,
+      };
+    }
+
+    return null;
   }
 
   private extractDroidPermissionOptions(params: PermissionRequest): DroidPermissionOption[] | null {
@@ -1988,31 +2402,31 @@ export class DroidAcpAgent implements Agent {
       {
         modeId: "off",
         droidValue: "proceed_once",
-        name: "Proceed (manual approvals)",
+        name: "Proceed (manual)",
         kind: "allow_once",
       },
       {
         modeId: "low",
         droidValue: "proceed_auto_run_low",
-        name: "Proceed (Auto Low)",
+        name: "Proceed (low)",
         kind: "allow_once",
       },
       {
         modeId: "medium",
         droidValue: "proceed_auto_run_medium",
-        name: "Proceed (Auto Medium)",
+        name: "Proceed (medium)",
         kind: "allow_once",
       },
       {
         modeId: "high",
         droidValue: "proceed_auto_run_high",
-        name: "Proceed (Auto High)",
+        name: "Proceed (high)",
         kind: "allow_once",
       },
       {
         modeId: "spec",
         droidValue: "cancel",
-        name: "No, keep iterating (stay in Spec)",
+        name: "Stay in Spec",
         kind: "reject_once",
       },
     ];
@@ -2041,9 +2455,13 @@ export class DroidAcpAgent implements Agent {
     params: {
       toolCallId: string;
       toolName: string;
+      toolCallTitle: string;
       command: string;
       riskLevel: "low" | "medium" | "high";
       rawInput: unknown;
+      toolCallKind: ToolKind;
+      toolCallContent: ToolCallContent[];
+      toolCallLocations: ToolCallLocation[] | undefined;
       droidOptions: DroidPermissionOption[] | null;
     },
   ): Promise<{ selectedOption: string }> {
@@ -2089,28 +2507,28 @@ export class DroidAcpAgent implements Agent {
         case "proceed_always": {
           const labelLower = opt.label.toLowerCase();
           if (labelLower.includes("low")) {
-            name = "Allow & auto-run low risk commands";
+            name = "Always (low)";
             break;
           }
           if (labelLower.includes("medium")) {
-            name = "Allow & auto-run medium risk commands";
+            name = "Always (medium)";
             break;
           }
           if (labelLower.includes("high")) {
-            name = "Allow & auto-run high risk commands";
+            name = "Always (high)";
             break;
           }
-          name = "Allow always";
+          name = "Always";
           break;
         }
         case "proceed_auto_run_low":
-          name = "Proceed & auto-run (low risk)";
+          name = "Auto-run (low)";
           break;
         case "proceed_auto_run_medium":
-          name = "Proceed & auto-run (medium risk)";
+          name = "Auto-run (medium)";
           break;
         case "proceed_auto_run_high":
-          name = "Proceed & auto-run (high risk)";
+          name = "Auto-run (high)";
           break;
         default:
           break;
@@ -2188,7 +2606,7 @@ export class DroidAcpAgent implements Agent {
               title: planTitle ? `Choose plan: ${planTitle}` : "Choose plan option",
               status: "pending",
               kind: "think",
-              rawInput: { choices },
+              rawInput: this.toolCallRawInputForClient({ choices }),
               content: [
                 {
                   type: "content",
@@ -2371,19 +2789,15 @@ export class DroidAcpAgent implements Agent {
 
     let permission: Awaited<ReturnType<AgentSideConnection["requestPermission"]>>;
     try {
-      const title =
-        params.toolName === "ExitSpecMode"
-          ? planTitle
-            ? `Exit spec mode: ${planTitle}`
-            : "Exit spec mode"
-          : `Running ${params.toolName} (${params.riskLevel}): ${params.command}`;
-
       permission = await this.client.requestPermission({
         sessionId: session.id,
         toolCall: {
           toolCallId: params.toolCallId,
-          title,
-          rawInput: params.rawInput,
+          title: params.toolCallTitle,
+          rawInput: this.toolCallRawInputForClient(params.rawInput),
+          kind: params.toolCallKind,
+          locations: params.toolCallLocations,
+          content: params.toolCallContent,
         },
         options: acpOptions,
       });
@@ -2574,24 +2988,67 @@ export class DroidAcpAgent implements Agent {
                 const initialStatus = isExitSpecMode ? "pending" : "in_progress";
                 session.toolCallStatus.set(toolCallId, initialStatus);
 
-                const spec = isExitSpecMode ? this.extractSpecTitleAndPlan(n.toolUse.input) : null;
+                const toolName = n.toolUse.name;
+                const rawInput = n.toolUse.input;
+
+                const isReadOnlyTool =
+                  toolName === "Read" ||
+                  toolName === "Grep" ||
+                  toolName === "Glob" ||
+                  toolName === "LS";
+                const riskLevelRaw = (rawInput as { riskLevel?: unknown } | null | undefined)
+                  ?.riskLevel;
+                const riskLevel =
+                  riskLevelRaw === "low" || riskLevelRaw === "medium" || riskLevelRaw === "high"
+                    ? riskLevelRaw
+                    : isReadOnlyTool
+                      ? "low"
+                      : "medium";
+
+                const toolCallKind: ToolKind = isExitSpecMode
+                  ? "switch_mode"
+                  : this.toolKindFromToolName(toolName);
+                const toolCallLocations = this.permissionLocationsFromRawInput({
+                  toolName,
+                  rawInput,
+                  cwd: session.cwd,
+                });
+
+                const spec = isExitSpecMode ? this.extractSpecTitleAndPlan(rawInput) : null;
+                const toolCallTitle = isExitSpecMode
+                  ? spec?.title
+                    ? `Exit spec mode: ${spec.title}`
+                    : "Exit spec mode"
+                  : this.formatPermissionToolCallTitle({
+                      stage: "run",
+                      toolName,
+                      riskLevel,
+                      rawInput,
+                      cwd: session.cwd,
+                    });
+
+                const toolCallContent = await this.buildPermissionToolCallContent({
+                  toolName,
+                  riskLevel,
+                  rawInput,
+                  cwd: session.cwd,
+                  planMarkdown: isExitSpecMode ? (spec?.plan ?? null) : null,
+                });
+
+                session.toolCallRawInputById.set(toolCallId, rawInput);
+                session.toolCallContentById.set(toolCallId, toolCallContent);
+
                 await this.client.sessionUpdate({
                   sessionId: session.id,
                   update: {
                     sessionUpdate: "tool_call",
                     toolCallId: toolCallId,
-                    title: isExitSpecMode
-                      ? spec?.title
-                        ? `Exit spec mode: ${spec.title}`
-                        : "Exit spec mode"
-                      : `Running ${n.toolUse.name}`,
-                    kind: isExitSpecMode ? ("switch_mode" as const) : undefined,
+                    title: toolCallTitle,
+                    kind: toolCallKind,
+                    locations: toolCallLocations,
                     status: initialStatus,
-                    rawInput: n.toolUse.input,
-                    content:
-                      isExitSpecMode && spec?.plan
-                        ? [{ type: "content", content: { type: "text", text: spec.plan } }]
-                        : undefined,
+                    rawInput: this.toolCallRawInputForClient(rawInput),
+                    content: toolCallContent,
                   },
                 });
               } else {
@@ -2641,21 +3098,28 @@ export class DroidAcpAgent implements Agent {
 
         const finalStatus = n.isError ? ("failed" as const) : ("completed" as const);
 
+        const preserved = (session.toolCallContentById.get(n.toolUseId) ?? []).filter(
+          (c) => c.type === "diff" || c.type === "terminal",
+        );
+        const merged: ToolCallContent[] = [
+          ...preserved,
+          {
+            type: "content",
+            content: {
+              type: "text",
+              text: n.content,
+            },
+          },
+        ];
+        session.toolCallContentById.set(n.toolUseId, merged);
+
         // Send the tool response content + completion status
         await this.client.sessionUpdate({
           sessionId: session.id,
           update: {
             sessionUpdate: "tool_call_update",
             toolCallId: n.toolUseId,
-            content: [
-              {
-                type: "content",
-                content: {
-                  type: "text",
-                  text: n.content,
-                },
-              },
-            ],
+            content: merged,
             rawOutput: n.content,
             status: finalStatus,
           },

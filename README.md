@@ -154,6 +154,7 @@ Add to your Zed `settings.json`:
 - `DROID_ACP_FACTORY_DIR` - Override Factory config dir (defaults to `~/.factory`)
 - `DROID_ACP_EXPERIMENT_SESSIONS` - Enable experimental sessions/history features (same as `--experiment-sessions`)
 - `DROID_ACP_REASONING_EFFORT` - Initial reasoning effort passed to `droid exec --reasoning-effort` (optional)
+- `DROID_DEBUG` - Enable adapter debug UI output (raw tool inputs, websearch proxy status, raw events)
 
 - `DROID_ACP_WEBSEARCH` - Enable local proxy to optionally intercept Droid websearch (`/api/tools/exa/search`)
 - `DROID_ACP_WEBSEARCH_FORWARD_URL` - Optional forward target for websearch (base URL or full URL)
@@ -161,7 +162,6 @@ Add to your Zed `settings.json`:
 - `DROID_ACP_WEBSEARCH_UPSTREAM_URL` - Optional upstream Factory API base URL (default: `FACTORY_API_BASE_URL_OVERRIDE` or `https://api.factory.ai`)
 - `DROID_ACP_WEBSEARCH_HOST` - Optional proxy bind host (default: `127.0.0.1`)
 - `DROID_ACP_WEBSEARCH_PORT` - Optional proxy bind port (default: auto-assign an available port)
-- `DROID_ACP_WEBSEARCH_DEBUG` - Emit a WebSearch status message in the ACP UI (e.g. Zed) for debugging
 
 - `SMITHERY_API_KEY` - Optional (recommended) Smithery Exa MCP API key (enables high-quality websearch)
 - `SMITHERY_PROFILE` - Optional Smithery Exa MCP profile id
@@ -179,7 +179,7 @@ DROID_ACP_WEBSEARCH=1 npx droid-acp
 To debug proxy wiring (shows `proxyBaseUrl` and a `/health` link in the ACP UI):
 
 ```bash
-DROID_ACP_WEBSEARCH=1 DROID_ACP_WEBSEARCH_DEBUG=1 npx droid-acp
+DROID_ACP_WEBSEARCH=1 DROID_DEBUG=1 npx droid-acp
 ```
 
 To forward WebSearch to your own HTTP handler instead:
