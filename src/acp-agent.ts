@@ -194,7 +194,9 @@ interface Session {
   pendingHistoryContext: string | null;
   model: string;
   mode: AcpModeId;
+  keepAliveOnDroidExit: boolean;
   cancelled: boolean;
+  restartPromise: Promise<void> | null;
   promptResolve: ((result: PromptResponse) => void) | null;
   capture: SessionCapture | null;
   lastSessionsListing: {
@@ -360,7 +362,9 @@ export class DroidAcpAgent implements Agent {
       pendingHistoryContext: null,
       model: initResult.settings?.modelId || "unknown",
       mode: initialMode,
+      keepAliveOnDroidExit: false,
       cancelled: false,
+      restartPromise: null,
       promptResolve: null,
       capture: null,
       lastSessionsListing: null,
@@ -421,6 +425,21 @@ export class DroidAcpAgent implements Agent {
         this.logger.log("Droid exited (stale), ignoring:", sessionId, "code:", code);
         return;
       }
+      if (current.keepAliveOnDroidExit) {
+        this.logger.log(
+          "Droid exited (restart requested), keeping session:",
+          sessionId,
+          "code:",
+          code,
+        );
+        current.keepAliveOnDroidExit = false;
+        if (current.promptResolve) {
+          current.promptResolve({ stopReason: "end_turn" });
+          current.promptResolve = null;
+        }
+        return;
+      }
+
       this.logger.log("Droid exited, cleaning up session:", sessionId, "code:", code);
       if (current.promptResolve) {
         current.promptResolve({ stopReason: "end_turn" });
@@ -871,11 +890,152 @@ export class DroidAcpAgent implements Agent {
     return transcript.slice(transcript.length - maxChars);
   }
 
+  private async finalizeActiveToolCalls(
+    session: Session,
+    params: { message: string },
+  ): Promise<void> {
+    const active = [...session.activeToolCallIds];
+    if (active.length === 0) return;
+
+    session.activeToolCallIds.clear();
+    for (const toolCallId of active) {
+      session.toolCallStatus.set(toolCallId, "completed");
+      await this.client.sessionUpdate({
+        sessionId: session.id,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "completed",
+          content: [
+            {
+              type: "content",
+              content: { type: "text", text: params.message },
+            },
+          ],
+        },
+      });
+    }
+  }
+
+  private async restartDroidSession(params: { sessionId: string; reason: string }): Promise<void> {
+    const session = this.sessions.get(params.sessionId);
+    if (!session) return;
+    if (session.restartPromise) return session.restartPromise;
+
+    const oldDroid = session.droid;
+    const cwd = session.cwd;
+    const title = session.title;
+    const oldMode = session.mode;
+    const oldModel = session.model;
+    const pendingHistoryContext = session.pendingHistoryContext;
+    const resumeSessionId = session.droidSessionId;
+
+    session.keepAliveOnDroidExit = true;
+    session.restartPromise = (async () => {
+      this.logger.log("Restarting droid session:", params.sessionId, "reason:", params.reason);
+
+      // Stop the old process first so we can safely resume/replace it.
+      try {
+        await oldDroid.stop();
+      } catch (err: unknown) {
+        this.logger.error("Failed to stop droid (during restart):", err);
+      }
+
+      const startFresh = async (): Promise<{ droid: DroidAdapter; init: InitSessionResult }> => {
+        const droid = createDroidAdapter({ cwd, logger: this.logger });
+        const init = await droid.start();
+        return { droid, init };
+      };
+
+      const startResumed = async (
+        sessionId: string,
+      ): Promise<{ droid: DroidAdapter; init: InitSessionResult }> => {
+        const droid = createDroidAdapter({ cwd, logger: this.logger, resumeSessionId: sessionId });
+        const init = await droid.start();
+        return { droid, init };
+      };
+
+      let started: { droid: DroidAdapter; init: InitSessionResult };
+      try {
+        started =
+          typeof resumeSessionId === "string" && resumeSessionId.length > 0
+            ? await startResumed(resumeSessionId)
+            : await startFresh();
+      } catch (err: unknown) {
+        this.logger.error("Failed to resume droid session, starting fresh:", err);
+        started = await startFresh();
+      }
+
+      const { droid, init } = started;
+      const { session: newSession } = this.attachSession({
+        sessionId: params.sessionId,
+        cwd,
+        droid,
+        initResult: init,
+        title: typeof title === "string" ? title : null,
+      });
+
+      newSession.pendingHistoryContext = pendingHistoryContext;
+
+      // Best-effort: preserve the current mode/model across the restart.
+      newSession.mode = oldMode;
+      newSession.droid.setMode(ACP_MODE_TO_DROID_AUTONOMY[oldMode]);
+      await this.client.sessionUpdate({
+        sessionId: newSession.id,
+        update: {
+          sessionUpdate: "current_mode_update",
+          currentModeId: oldMode,
+        },
+      });
+
+      if (newSession.availableModels.some((m) => m.id === oldModel)) {
+        newSession.model = oldModel;
+        newSession.droid.setModel(oldModel);
+      }
+
+      newSession.cancelled = false;
+    })()
+      .catch((err: unknown) => {
+        this.logger.error("restartDroidSession failed:", err);
+      })
+      .finally(() => {
+        const current = this.sessions.get(params.sessionId);
+        if (current) {
+          current.restartPromise = null;
+          current.keepAliveOnDroidExit = false;
+          current.cancelled = false;
+        }
+      });
+
+    return session.restartPromise;
+  }
+
+  private async getReadySession(params: { sessionId: string; reason: string }): Promise<Session> {
+    const { sessionId } = params;
+    let session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+
+    if (session.restartPromise) {
+      await session.restartPromise;
+      session = this.sessions.get(sessionId);
+      if (!session) throw new Error(`Session not found: ${sessionId}`);
+    }
+
+    if (session.cancelled || !session.droid.isRunning()) {
+      await this.restartDroidSession({ sessionId, reason: params.reason });
+      session = this.sessions.get(sessionId);
+      if (!session) throw new Error(`Session not found: ${sessionId}`);
+    }
+
+    return session;
+  }
+
   async prompt(request: PromptRequest): Promise<PromptResponse> {
-    const session = this.sessions.get(request.sessionId);
+    let session = this.sessions.get(request.sessionId);
     if (!session) throw new Error(`Session not found: ${request.sessionId}`);
-    if (session.cancelled) throw new Error("Session cancelled");
     if (session.promptResolve) throw new Error("Another prompt is already in progress");
+
+    session = await this.getReadySession({ sessionId: request.sessionId, reason: "prompt" });
 
     this.logger.log("prompt:", request.sessionId);
 
@@ -1010,16 +1170,37 @@ export class DroidAcpAgent implements Agent {
 
   async cancel(request: CancelNotification): Promise<void> {
     const session = this.sessions.get(request.sessionId);
-    if (session) {
-      this.logger.log("cancel:", request.sessionId);
-      session.cancelled = true;
-      if (session.promptResolve) {
-        session.promptResolve({ stopReason: "cancelled" });
-        session.promptResolve = null;
-      }
-      await session.droid.stop();
-      this.sessions.delete(request.sessionId);
+    if (!session) return;
+
+    const hasInFlightWork =
+      session.promptResolve !== null ||
+      session.capture !== null ||
+      session.activeToolCallIds.size > 0;
+    if (!hasInFlightWork) {
+      this.logger.log("cancel (no-op):", request.sessionId);
+      return;
     }
+
+    this.logger.log("cancel:", request.sessionId);
+    session.cancelled = true;
+
+    if (session.promptResolve) {
+      session.promptResolve({ stopReason: "cancelled" });
+      session.promptResolve = null;
+    }
+
+    if (session.capture) {
+      const capture = session.capture;
+      session.capture = null;
+      clearTimeout(capture.timeoutId);
+      if (capture.finalizeTimeoutId) clearTimeout(capture.finalizeTimeoutId);
+      capture.reject(new Error("Cancelled"));
+    }
+
+    await this.finalizeActiveToolCalls(session, { message: "Cancelled." });
+
+    // Restart droid in the background so the ACP session remains usable after cancellation.
+    void this.restartDroidSession({ sessionId: request.sessionId, reason: "cancel" });
   }
 
   async unstable_setSessionModel(
@@ -2922,6 +3103,12 @@ export class DroidAcpAgent implements Agent {
 
   private async handleNotification(session: Session, n: DroidNotification): Promise<void> {
     this.logger.log("notification:", n.type);
+
+    // If the user cancelled the current turn, avoid emitting stale tool calls / messages
+    // from the previous droid process. We'll restart and resume shortly.
+    if (session.cancelled) {
+      return;
+    }
 
     switch (n.type) {
       case "settings_updated": {
