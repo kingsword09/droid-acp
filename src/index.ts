@@ -13,6 +13,10 @@ import { spawn } from "node:child_process";
 import { runAcp } from "./acp-agent.ts";
 import { findDroidExecutable, isEnvEnabled, isWindows } from "./utils.ts";
 import { startWebsearchProxy, type WebsearchProxyHandle } from "./websearch-proxy.ts";
+import {
+  startNativeWebsearchProxy,
+  type NativeWebsearchProxyHandle,
+} from "./websearch-native.ts";
 
 function pickArgValue(argv: string[], names: string[]): string | null {
   for (let i = 0; i < argv.length; i += 1) {
@@ -51,7 +55,7 @@ function runNativeAcp(): void {
   console.error(`[droid-acp] Starting droid with native ACP: ${executable} ${args.join(" ")}`);
   console.error("[droid-acp] WARNING: Native ACP mode does not support custom models!");
 
-  let websearchProxy: WebsearchProxyHandle | null = null;
+  let websearchProxy: WebsearchProxyHandle | NativeWebsearchProxyHandle | null = null;
   const stopWebsearchProxy = () => {
     if (!websearchProxy) return;
     const proxy = websearchProxy;
@@ -62,6 +66,42 @@ function runNativeAcp(): void {
   };
 
   const startWebsearchProxyIfEnabled = async () => {
+    // Experimental: Native websearch proxy mode (--websearch-proxy flag)
+    const useNativeWebsearch = isEnvEnabled(env.DROID_ACP_WEBSEARCH_NATIVE);
+
+    if (useNativeWebsearch) {
+      const host = env.DROID_ACP_WEBSEARCH_HOST ?? "127.0.0.1";
+      const portRaw = env.DROID_ACP_WEBSEARCH_PORT;
+      let port: number | undefined;
+      if (typeof portRaw === "string" && portRaw.length > 0) {
+        const parsed = Number.parseInt(portRaw, 10);
+        if (Number.isNaN(parsed) || parsed < 0 || parsed > 65535) {
+          throw new Error(`Invalid DROID_ACP_WEBSEARCH_PORT: ${portRaw}`);
+        }
+        port = parsed;
+      }
+      const factoryApiUrl =
+        env.DROID_ACP_WEBSEARCH_UPSTREAM_URL ??
+        env.FACTORY_API_BASE_URL_OVERRIDE ??
+        "https://api.factory.ai";
+
+      console.error("[droid-acp] Starting native provider proxy (experimental)...");
+      websearchProxy = await startNativeWebsearchProxy({
+        factoryApiUrl,
+        host,
+        port,
+        logger: console,
+      });
+
+      if (!env.FACTORY_API_KEY) {
+        env.FACTORY_API_KEY = "droid-acp-websearch";
+      }
+      env.FACTORY_API_BASE_URL_OVERRIDE = websearchProxy.baseUrl;
+      env.FACTORY_API_BASE_URL = websearchProxy.baseUrl;
+      return;
+    }
+
+    // Standard websearch proxy mode
     const hasExplicitToggle = typeof env.DROID_ACP_WEBSEARCH === "string";
     const smitheryConfigured =
       typeof env.SMITHERY_API_KEY === "string" &&
@@ -197,6 +237,7 @@ function runNativeAcp(): void {
 // Parse command line arguments
 const useNativeAcp = process.argv.includes("--acp");
 const enableExperimentSessions = process.argv.includes("--experiment-sessions");
+const enableWebsearchProxy = process.argv.includes("--websearch-proxy");
 
 const reasoningEffort = pickArgValue(process.argv, ["--reasoning-effort", "-r"]);
 if (reasoningEffort) {
@@ -205,6 +246,10 @@ if (reasoningEffort) {
 
 if (enableExperimentSessions) {
   process.env.DROID_ACP_EXPERIMENT_SESSIONS = "1";
+}
+
+if (enableWebsearchProxy) {
+  process.env.DROID_ACP_WEBSEARCH_NATIVE = "1";
 }
 
 if (useNativeAcp) {
