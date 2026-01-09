@@ -2,6 +2,7 @@ import type { AgentSideConnection, ToolCallContent, ToolKind } from "@agentclien
 import type { DroidNotification } from "../../types.ts";
 import type { Logger } from "../../utils.ts";
 import { isEnvEnabled } from "../../utils.ts";
+import { isDebugEnabled } from "../flags.ts";
 import type { Session } from "../session-types.ts";
 import { buildPermissionToolCallContent } from "../permissions/content.ts";
 import { toolCallRawInputForClient, formatPermissionToolCallTitle } from "../permissions/format.ts";
@@ -65,22 +66,54 @@ export async function handleNotification(
         }
 
         // Handle tool use in message
+        if (n.toolUse && isDebugEnabled()) {
+          ctx.logger.log("[ToolUse] name:", n.toolUse.name, "suppressed:", suppressAssistantOutput);
+        }
         if (n.toolUse && !suppressAssistantOutput) {
           if (n.toolUse.name === "TodoWrite") {
-            const todos = (n.toolUse.input as { todos?: unknown })?.todos;
-            if (Array.isArray(todos)) {
-              const toStatus = (status: unknown): "pending" | "in_progress" | "completed" => {
-                switch (status) {
-                  case "pending":
-                  case "in_progress":
-                  case "completed":
-                    return status;
-                  default:
-                    return "pending";
-                }
-              };
+            const todosRaw = (n.toolUse.input as { todos?: unknown })?.todos;
+            if (isDebugEnabled()) {
+              ctx.logger.log("[TodoWrite] Received input:", typeof todosRaw, todosRaw);
+            }
 
-              const entries = todos
+            const toStatus = (status: unknown): "pending" | "in_progress" | "completed" => {
+              switch (status) {
+                case "pending":
+                case "in_progress":
+                case "completed":
+                  return status;
+                default:
+                  return "pending";
+              }
+            };
+
+            let entries: Array<{
+              content: string;
+              status: "pending" | "in_progress" | "completed";
+              priority: "high" | "medium" | "low";
+            }> = [];
+
+            if (typeof todosRaw === "string") {
+              // Parse string format: "1. [status] content" or "- [status] content"
+              const lines = todosRaw.split("\n").filter((line) => line.trim().length > 0);
+              entries = lines
+                .map((line) => {
+                  // Match patterns like "1. [in_progress] Task" or "- [pending] Task"
+                  const match = line.match(/^(?:\d+\.|-)?\s*\[(\w+)\]\s*(.+)$/);
+                  if (match) {
+                    const [, statusStr, content] = match;
+                    return {
+                      content: content.trim(),
+                      status: toStatus(statusStr),
+                      priority: "medium" as const,
+                    };
+                  }
+                  return null;
+                })
+                .filter((e): e is NonNullable<typeof e> => e !== null && e.content.length > 0);
+            } else if (Array.isArray(todosRaw)) {
+              // Handle array format (legacy)
+              entries = todosRaw
                 .map((t) => {
                   const todo = t as { content?: unknown; status?: unknown };
                   return {
@@ -90,7 +123,17 @@ export async function handleNotification(
                   };
                 })
                 .filter((e) => e.content.length > 0);
+            }
 
+            if (entries.length > 0) {
+              if (isDebugEnabled()) {
+                ctx.logger.log(
+                  "[TodoWrite] Sending plan_update with",
+                  entries.length,
+                  "entries:",
+                  entries,
+                );
+              }
               await ctx.client.sessionUpdate({
                 sessionId: session.id,
                 update: {
