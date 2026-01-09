@@ -13,10 +13,7 @@ import { spawn } from "node:child_process";
 import { runAcp } from "./acp-agent.ts";
 import { findDroidExecutable, isEnvEnabled, isWindows } from "./utils.ts";
 import { startWebsearchProxy, type WebsearchProxyHandle } from "./websearch-proxy.ts";
-import {
-  startNativeWebsearchProxy,
-  type NativeWebsearchProxyHandle,
-} from "./websearch-native.ts";
+import { startNativeWebsearchProxy, type NativeWebsearchProxyHandle } from "./websearch-native.ts";
 
 function pickArgValue(argv: string[], names: string[]): string | null {
   for (let i = 0; i < argv.length; i += 1) {

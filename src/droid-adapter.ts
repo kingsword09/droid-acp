@@ -3,10 +3,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { findDroidExecutable, isEnvEnabled, isWindows, type Logger } from "./utils.ts";
 import { startWebsearchProxy, type WebsearchProxyHandle } from "./websearch-proxy.ts";
-import {
-  startNativeWebsearchProxy,
-  type NativeWebsearchProxyHandle,
-} from "./websearch-native.ts";
+import { startNativeWebsearchProxy, type NativeWebsearchProxyHandle } from "./websearch-native.ts";
 import type {
   DroidAutonomyLevel,
   DroidNotification,
