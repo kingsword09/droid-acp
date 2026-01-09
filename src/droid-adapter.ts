@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { findDroidExecutable, isEnvEnabled, isWindows, type Logger } from "./utils.ts";
 import { startWebsearchProxy, type WebsearchProxyHandle } from "./websearch-proxy.ts";
+import { startNativeWebsearchProxy, type NativeWebsearchProxyHandle } from "./websearch-native.ts";
 import type {
   DroidAutonomyLevel,
   DroidNotification,
@@ -40,7 +41,7 @@ export interface DroidAdapter {
 export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
   let process: ChildProcess | null = null;
   let sessionId: string | null = null;
-  let websearchProxy: WebsearchProxyHandle | null = null;
+  let websearchProxy: WebsearchProxyHandle | NativeWebsearchProxyHandle | null = null;
   const machineId = randomUUID();
   const logger = options.logger ?? console;
 
@@ -413,47 +414,12 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
         args.push("--reasoning-effort", reasoningEffort.trim());
       }
 
-      const hasExplicitToggle = typeof env.DROID_ACP_WEBSEARCH === "string";
-      const smitheryConfigured =
-        typeof env.SMITHERY_API_KEY === "string" &&
-        env.SMITHERY_API_KEY.trim().length > 0 &&
-        typeof env.SMITHERY_PROFILE === "string" &&
-        env.SMITHERY_PROFILE.trim().length > 0;
-      const forwardConfigured =
-        typeof env.DROID_ACP_WEBSEARCH_FORWARD_URL === "string" &&
-        env.DROID_ACP_WEBSEARCH_FORWARD_URL.trim().length > 0;
+      // Experimental: Native websearch proxy mode (--websearch-proxy flag)
+      const useNativeWebsearch = isEnvEnabled(env.DROID_ACP_WEBSEARCH_NATIVE);
 
-      const enableWebsearchProxy = hasExplicitToggle
-        ? isEnvEnabled(env.DROID_ACP_WEBSEARCH)
-        : smitheryConfigured || forwardConfigured;
-
-      if (enableWebsearchProxy) {
+      if (useNativeWebsearch) {
         stopWebsearchProxy();
-
-        const upstreamBaseUrl =
-          env.DROID_ACP_WEBSEARCH_UPSTREAM_URL ??
-          env.FACTORY_API_BASE_URL_OVERRIDE ??
-          "https://api.factory.ai";
-        const forwardModeRaw = env.DROID_ACP_WEBSEARCH_FORWARD_MODE;
-
-        const forwardUrlRaw =
-          typeof env.DROID_ACP_WEBSEARCH_FORWARD_URL === "string"
-            ? env.DROID_ACP_WEBSEARCH_FORWARD_URL.trim()
-            : "";
-        const forwardPrefixMatch = forwardUrlRaw.match(/^mcp:(.*)$/i);
-        const websearchForwardUrl = forwardUrlRaw.length > 0 ? forwardUrlRaw : undefined;
-        const forwardModeNormalized =
-          typeof forwardModeRaw === "string" ? forwardModeRaw.trim().toLowerCase() : "";
-        const websearchForwardMode =
-          forwardModeNormalized === "mcp"
-            ? ("mcp" as const)
-            : forwardModeNormalized === "http"
-              ? ("http" as const)
-              : forwardPrefixMatch
-                ? ("mcp" as const)
-                : ("http" as const);
         const host = env.DROID_ACP_WEBSEARCH_HOST ?? "127.0.0.1";
-
         const portRaw = env.DROID_ACP_WEBSEARCH_PORT;
         let port: number | undefined;
         if (typeof portRaw === "string" && portRaw.length > 0) {
@@ -463,28 +429,99 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
           }
           port = parsed;
         }
+        const factoryApiUrl =
+          env.DROID_ACP_WEBSEARCH_UPSTREAM_URL ??
+          env.FACTORY_API_BASE_URL_OVERRIDE ??
+          "https://api.factory.ai";
 
-        websearchProxy = await startWebsearchProxy({
-          upstreamBaseUrl,
-          websearchForwardUrl: forwardPrefixMatch
-            ? forwardPrefixMatch[1]?.trim()
-            : websearchForwardUrl,
-          websearchForwardMode,
-          smitheryApiKey: env.SMITHERY_API_KEY,
-          smitheryProfile: env.SMITHERY_PROFILE,
+        logger.log("[websearch] Starting native provider proxy (experimental)...");
+        websearchProxy = await startNativeWebsearchProxy({
+          factoryApiUrl,
           host,
           port,
           logger,
         });
 
-        // Droid requires an auth header for tool calls (including websearch) and will error early if missing.
-        // Since websearch is intercepted by the local proxy, any non-empty value is sufficient here.
         if (!env.FACTORY_API_KEY) {
           env.FACTORY_API_KEY = "droid-acp-websearch";
         }
-
         env.FACTORY_API_BASE_URL_OVERRIDE = websearchProxy.baseUrl;
         env.FACTORY_API_BASE_URL = websearchProxy.baseUrl;
+      } else {
+        // Standard websearch proxy mode
+        const hasExplicitToggle = typeof env.DROID_ACP_WEBSEARCH === "string";
+        const smitheryConfigured =
+          typeof env.SMITHERY_API_KEY === "string" &&
+          env.SMITHERY_API_KEY.trim().length > 0 &&
+          typeof env.SMITHERY_PROFILE === "string" &&
+          env.SMITHERY_PROFILE.trim().length > 0;
+        const forwardConfigured =
+          typeof env.DROID_ACP_WEBSEARCH_FORWARD_URL === "string" &&
+          env.DROID_ACP_WEBSEARCH_FORWARD_URL.trim().length > 0;
+
+        const enableWebsearchProxy = hasExplicitToggle
+          ? isEnvEnabled(env.DROID_ACP_WEBSEARCH)
+          : smitheryConfigured || forwardConfigured;
+
+        if (enableWebsearchProxy) {
+          stopWebsearchProxy();
+
+          const upstreamBaseUrl =
+            env.DROID_ACP_WEBSEARCH_UPSTREAM_URL ??
+            env.FACTORY_API_BASE_URL_OVERRIDE ??
+            "https://api.factory.ai";
+          const forwardModeRaw = env.DROID_ACP_WEBSEARCH_FORWARD_MODE;
+
+          const forwardUrlRaw =
+            typeof env.DROID_ACP_WEBSEARCH_FORWARD_URL === "string"
+              ? env.DROID_ACP_WEBSEARCH_FORWARD_URL.trim()
+              : "";
+          const forwardPrefixMatch = forwardUrlRaw.match(/^mcp:(.*)$/i);
+          const websearchForwardUrl = forwardUrlRaw.length > 0 ? forwardUrlRaw : undefined;
+          const forwardModeNormalized =
+            typeof forwardModeRaw === "string" ? forwardModeRaw.trim().toLowerCase() : "";
+          const websearchForwardMode =
+            forwardModeNormalized === "mcp"
+              ? ("mcp" as const)
+              : forwardModeNormalized === "http"
+                ? ("http" as const)
+                : forwardPrefixMatch
+                  ? ("mcp" as const)
+                  : ("http" as const);
+          const host = env.DROID_ACP_WEBSEARCH_HOST ?? "127.0.0.1";
+
+          const portRaw = env.DROID_ACP_WEBSEARCH_PORT;
+          let port: number | undefined;
+          if (typeof portRaw === "string" && portRaw.length > 0) {
+            const parsed = Number.parseInt(portRaw, 10);
+            if (Number.isNaN(parsed) || parsed < 0 || parsed > 65535) {
+              throw new Error(`Invalid DROID_ACP_WEBSEARCH_PORT: ${portRaw}`);
+            }
+            port = parsed;
+          }
+
+          websearchProxy = await startWebsearchProxy({
+            upstreamBaseUrl,
+            websearchForwardUrl: forwardPrefixMatch
+              ? forwardPrefixMatch[1]?.trim()
+              : websearchForwardUrl,
+            websearchForwardMode,
+            smitheryApiKey: env.SMITHERY_API_KEY,
+            smitheryProfile: env.SMITHERY_PROFILE,
+            host,
+            port,
+            logger,
+          });
+
+          // Droid requires an auth header for tool calls (including websearch) and will error early if missing.
+          // Since websearch is intercepted by the local proxy, any non-empty value is sufficient here.
+          if (!env.FACTORY_API_KEY) {
+            env.FACTORY_API_KEY = "droid-acp-websearch";
+          }
+
+          env.FACTORY_API_BASE_URL_OVERRIDE = websearchProxy.baseUrl;
+          env.FACTORY_API_BASE_URL = websearchProxy.baseUrl;
+        }
       }
 
       process = spawn(executable, args, {
