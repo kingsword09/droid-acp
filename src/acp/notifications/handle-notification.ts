@@ -127,7 +127,12 @@ export async function handleNotification(
 
             if (entries.length > 0) {
               if (isDebugEnabled()) {
-                ctx.logger.log("[TodoWrite] Sending plan_update with", entries.length, "entries:", entries);
+                ctx.logger.log(
+                  "[TodoWrite] Sending plan_update with",
+                  entries.length,
+                  "entries:",
+                  entries,
+                );
               }
               await ctx.client.sessionUpdate({
                 sessionId: session.id,
