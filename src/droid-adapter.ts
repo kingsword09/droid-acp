@@ -431,6 +431,7 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
         }
         const factoryApiUrl =
           env.DROID_ACP_WEBSEARCH_UPSTREAM_URL ??
+          env.FACTORY_API_BASE_URL ??
           env.FACTORY_API_BASE_URL_OVERRIDE ??
           "https://api.factory.ai";
 
@@ -468,6 +469,7 @@ export function createDroidAdapter(options: DroidAdapterOptions): DroidAdapter {
 
           const upstreamBaseUrl =
             env.DROID_ACP_WEBSEARCH_UPSTREAM_URL ??
+            env.FACTORY_API_BASE_URL ??
             env.FACTORY_API_BASE_URL_OVERRIDE ??
             "https://api.factory.ai";
           const forwardModeRaw = env.DROID_ACP_WEBSEARCH_FORWARD_MODE;
