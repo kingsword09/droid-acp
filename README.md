@@ -158,7 +158,7 @@ Add to your Zed `settings.json`:
 - `DROID_ACP_WEBSEARCH` - Enable local WebSearch proxy. When unset, the proxy auto-enables if `SMITHERY_API_KEY`+`SMITHERY_PROFILE` or `DROID_ACP_WEBSEARCH_FORWARD_URL` is set (set to `0` to force disable).
 - `DROID_ACP_WEBSEARCH_FORWARD_URL` - Optional forward target for websearch (base URL or full URL)
 - `DROID_ACP_WEBSEARCH_FORWARD_MODE` - (Legacy) Forward mode for `DROID_ACP_WEBSEARCH_FORWARD_URL` (`http` or `mcp`, default: `http`). Prefer `mcp:` prefix in the forward URL.
-- `DROID_ACP_WEBSEARCH_UPSTREAM_URL` - Optional upstream Factory API base URL (default: `FACTORY_API_BASE_URL_OVERRIDE` or `https://api.factory.ai`)
+- `DROID_ACP_WEBSEARCH_UPSTREAM_URL` - Optional upstream Factory API base URL (default: `FACTORY_API_BASE_URL`, then `FACTORY_API_BASE_URL_OVERRIDE`, then `https://api.factory.ai`)
 - `DROID_ACP_WEBSEARCH_HOST` - Optional proxy bind host (default: `127.0.0.1`)
 - `DROID_ACP_WEBSEARCH_PORT` - Optional proxy bind port (default: auto-assign an available port)
 

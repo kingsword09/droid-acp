@@ -79,6 +79,7 @@ function runNativeAcp(): void {
       }
       const factoryApiUrl =
         env.DROID_ACP_WEBSEARCH_UPSTREAM_URL ??
+        env.FACTORY_API_BASE_URL ??
         env.FACTORY_API_BASE_URL_OVERRIDE ??
         "https://api.factory.ai";
 
@@ -117,6 +118,7 @@ function runNativeAcp(): void {
 
     const upstreamBaseUrl =
       env.DROID_ACP_WEBSEARCH_UPSTREAM_URL ??
+      env.FACTORY_API_BASE_URL ??
       env.FACTORY_API_BASE_URL_OVERRIDE ??
       "https://api.factory.ai";
 
