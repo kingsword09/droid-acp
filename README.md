@@ -38,7 +38,7 @@ npm install droid-acp
 ### Running
 
 ```bash
-# Default mode (stream-jsonrpc, supports custom models)
+# Default mode
 npx droid-acp
 
 # Set initial reasoning effort (passes through to `droid exec --reasoning-effort`)
@@ -46,10 +46,9 @@ npx droid-acp --reasoning-effort high
 
 # Enable experimental sessions/history helpers
 npx droid-acp --experiment-sessions
-
-# Native ACP mode (lighter, but no custom model support)
-npx droid-acp --acp
 ```
+
+> **Note:** For official native ACP support, see [Factory Droid Zed Integration](https://docs.factory.ai/integrations/zed#configure-factory-droid-as-an-agent-agent_servers).
 
 ### With Zed Editor
 
@@ -62,23 +61,6 @@ Add to your Zed `settings.json`:
       "type": "custom",
       "command": "npx",
       "args": ["droid-acp"],
-      "env": {
-        "FACTORY_API_KEY": "fk-your-api-key-here"
-      }
-    }
-  }
-}
-```
-
-**Using native ACP mode (no custom model support):**
-
-```json
-{
-  "agent_servers": {
-    "Droid Native": {
-      "type": "custom",
-      "command": "npx",
-      "args": ["droid-acp", "--acp"],
       "env": {
         "FACTORY_API_KEY": "fk-your-api-key-here"
       }
@@ -136,15 +118,6 @@ Add to your Zed `settings.json`:
   }
 }
 ```
-
-### Modes
-
-| Command               | Mode           | Custom Models    | Description                   |
-| --------------------- | -------------- | ---------------- | ----------------------------- |
-| `npx droid-acp`       | stream-jsonrpc | ✅ Supported     | Default, recommended          |
-| `npx droid-acp --acp` | native ACP     | ❌ Not supported | Lighter, direct pipe to droid |
-
-> **Note:** Native ACP mode (`--acp`) has a limitation in droid where custom models configured in `~/.factory/config.json` are not recognized. Use the default stream-jsonrpc mode if you need custom models.
 
 ### Environment Variables
 
@@ -233,7 +206,6 @@ Notes:
 - Session titles are sanitized (some Droid sessions store titles like `<context ref="session_history"> ...`).
 - Session IDs are displayed as plain text for easy copy/paste.
 - Times shown in `/sessions` are displayed as `YYYY-MM-DD HH:mm:ss` in your local timezone.
-- Native ACP mode (`--acp`) does not support these helpers.
 
 ## Context / Token Usage (`/context`)
 
@@ -254,7 +226,6 @@ Droid’s built-in `/compress` is TUI-only. In stream-jsonrpc mode, droid-acp im
 
 Notes:
 
-- This is an adapter-level feature; it is **not available** in native ACP mode (`npx droid-acp --acp`).
 - The generated summary is captured silently (it is not shown in the chat transcript) and will be appended to your next message as embedded context.
 - You can pass optional instructions: `/compress focus on current code changes and next steps`.
 
